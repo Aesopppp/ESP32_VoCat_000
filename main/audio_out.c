@@ -1,0 +1,457 @@
+/* VoCat v1.2：ES8311 输出 + ES7210 TDM 麦克风/硬件回采，共享 I2S 时钟。 */
+#include "audio_out.h"
+#include "board_config.h"
+#include "event_bus.h"
+#include "opus_codec.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_tdm.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "pcm_policy.h"
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+_Static_assert(AUDIO_OUT_SAMPLE_RATE == BSP_I2S_SAMPLE_RATE,
+               "VoCat hardware and network PCM rates must match");
+
+static i2s_chan_handle_t tx, rx;
+static esp_codec_dev_handle_t speaker, microphone;
+static const audio_codec_data_if_t *data_if;
+static const audio_codec_ctrl_if_t *dac_ctrl, *adc_ctrl;
+static const audio_codec_if_t *dac_if, *adc_if;
+static const audio_codec_gpio_if_t *gpio_if;
+static opus_dec_handle_t decoder;
+static SemaphoreHandle_t output_lock;
+static atomic_int state;
+static atomic_int output_volume;
+static audio_out_event_cb_t callback;
+static void *callback_arg;
+static atomic_bool playback_streaming;
+static atomic_uint last_voice_ms;
+/* 网络回调仅设置原子标志；worker 负责真正清队列和刷新 DMA。 */
+static atomic_bool stop_requested;
+static TaskHandle_t playback_task;
+static atomic_bool task_exit, task_exited;
+static int16_t pcm_ring[PCM_CAPACITY], decode_pcm[1920];
+static size_t pcm_read, pcm_write, pcm_count;
+static bool stream_open, stream_eof, stream_drained = true, output_started;
+/* output_lock 保护；与有效语音计时分开，静音/弱音包也保持播放画面。 */
+static bool pcm_received;
+static uint32_t last_pcm_ms;
+static unsigned drain_blocks, fade_samples;
+static uint32_t voice_samples, received_voice_samples;
+static uint32_t received_abs_sum;
+static size_t received_samples;
+static int64_t prefill_started_us;
+static int16_t last_sample;
+static uint32_t underruns, supplied_samples, decoded_packets, decode_max_us, write_max_us;
+static uint32_t decode_total_us, decode_samples, decode_over_budget;
+/* 解码后、音量增益前的幅度诊断；与输出活动计时分开，静音包不续会话。 */
+static uint32_t signal_peak, signal_samples, signal_nonzero;
+static uint64_t signal_abs_sum;
+static int64_t stats_at;
+static void playback_worker(void *arg);
+
+
+esp_err_t audio_out_init(uint8_t i2c_addr)
+{
+    if (speaker) return ESP_OK;
+    i2c_master_bus_handle_t bus;
+    esp_err_t err=i2c_master_get_bus_handle(BSP_I2C_PORT,&bus);
+    if (err!=ESP_OK) return err;
+    i2s_chan_config_t channel=I2S_CHANNEL_DEFAULT_CONFIG(BSP_I2S_PORT,I2S_ROLE_MASTER);
+    channel.auto_clear=true;
+    channel.dma_frame_num=PCM_BLOCK;
+    channel.dma_desc_num=PCM_DMA_BLOCKS;
+    if ((err=i2s_new_channel(&channel,&tx,&rx))!=ESP_OK) return err;
+    i2s_std_config_t config={
+        .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_OUT_SAMPLE_RATE),
+        .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,I2S_SLOT_MODE_STEREO),
+        .gpio_cfg={.mclk=BSP_I2S_MCLK_PIN,.bclk=BSP_I2S_BCLK_PIN,
+                   .ws=BSP_I2S_WS_PIN,.dout=BSP_I2S_DOUT_PIN,.din=I2S_GPIO_UNUSED},
+    };
+    config.slot_cfg.left_align = true;
+    /* ADC 物理通道顺序为 MIC1/MIC3/MIC2/MIC4。全部打开，再由
+     * codec_dev 的 RX channel_mask 选择前两槽，向 AFE 返回交错 MR。
+     */
+    i2s_tdm_config_t input = {
+        .clk_cfg = I2S_TDM_CLK_DEFAULT_CONFIG(AUDIO_OUT_SAMPLE_RATE),
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+            I2S_SLOT_MODE_STEREO, I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3),
+        .gpio_cfg = {.mclk=BSP_I2S_MCLK_PIN, .bclk=BSP_I2S_BCLK_PIN,
+            .ws=BSP_I2S_WS_PIN, .dout=I2S_GPIO_UNUSED, .din=BSP_I2S_DIN_PIN},
+    };
+    input.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    input.clk_cfg.bclk_div = 8;
+    if ((err=i2s_channel_init_std_mode(tx,&config))!=ESP_OK) goto fail;
+    if ((err=i2s_channel_init_tdm_mode(rx,&input))!=ESP_OK) goto fail;
+    if ((err=i2s_channel_enable(tx))!=ESP_OK) goto fail;
+    if ((err=i2s_channel_enable(rx))!=ESP_OK) goto fail;
+    audio_codec_i2s_cfg_t data_cfg={.port=BSP_I2S_PORT,.tx_handle=tx,.rx_handle=rx};
+    data_if=audio_codec_new_i2s_data(&data_cfg);
+    /* codec_dev expects the 8-bit address, board_config stores 7-bit addresses. */
+    audio_codec_i2c_cfg_t ctrl_cfg={.port=BSP_I2C_PORT,.addr=i2c_addr<<1,.bus_handle=bus,
+        .clock_speed_hz=BSP_I2C_FREQ_HZ};
+    dac_ctrl=audio_codec_new_i2c_ctrl(&ctrl_cfg);
+    ctrl_cfg.addr=ES7210_I2C_ADDR<<1;
+    adc_ctrl=audio_codec_new_i2c_ctrl(&ctrl_cfg);
+    gpio_if=audio_codec_new_gpio();
+    if (!data_if||!dac_ctrl||!adc_ctrl||!gpio_if) {err=ESP_ERR_NO_MEM;goto fail;}
+    es8311_codec_cfg_t dac_cfg={.ctrl_if=dac_ctrl,.gpio_if=gpio_if,
+        .codec_mode=ESP_CODEC_DEV_WORK_MODE_DAC,.pa_pin=BSP_PA_EN_PIN,.use_mclk=true,
+        .hw_gain={.pa_voltage=5.0f,.codec_dac_voltage=3.3f}};
+    es7210_codec_cfg_t adc_cfg={.ctrl_if=adc_ctrl,.mic_selected=
+        ES7210_SEL_MIC1|ES7210_SEL_MIC2|ES7210_SEL_MIC3|ES7210_SEL_MIC4};
+    dac_if=es8311_codec_new(&dac_cfg); adc_if=es7210_codec_new(&adc_cfg);
+    if (!dac_if||!adc_if) {err=ESP_ERR_NO_MEM;goto fail;}
+    esp_codec_dev_cfg_t dev_cfg={.dev_type=ESP_CODEC_DEV_TYPE_OUT,.codec_if=dac_if,.data_if=data_if};
+    speaker=esp_codec_dev_new(&dev_cfg);
+    dev_cfg.dev_type=ESP_CODEC_DEV_TYPE_IN; dev_cfg.codec_if=adc_if;
+    microphone=esp_codec_dev_new(&dev_cfg);
+    if (!speaker||!microphone) {err=ESP_ERR_NO_MEM;goto fail;}
+    /* 先打开 ADC，再打开单声道 DAC。codec_dev 负责共享时钟的槽宽适配；
+     * 应用层仍只读 MR 两路、只写单声道，不手动拼接 TDM 填充字节。
+     */
+    esp_codec_dev_sample_info_t input_sample = {
+        .sample_rate=AUDIO_OUT_SAMPLE_RATE, .channel=4, .bits_per_sample=16,
+        .channel_mask=ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0)|ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1),
+    };
+    esp_codec_dev_sample_info_t output_sample = {
+        .sample_rate=AUDIO_OUT_SAMPLE_RATE, .channel=1, .bits_per_sample=16,
+    };
+    if ((err=esp_codec_dev_open(microphone,&input_sample))!=ESP_OK) goto fail;
+    if ((err=esp_codec_dev_open(speaker,&output_sample))!=ESP_OK) goto fail;
+    if ((err=esp_codec_dev_set_out_vol(speaker,AUDIO_OUT_DEFAULT_VOLUME))!=ESP_OK) goto fail;
+    atomic_store(&output_volume, AUDIO_OUT_DEFAULT_VOLUME);
+    /* 增益掩码是物理 MIC 编号；MIC3 对应 TDM slot1 的扬声器回采。 */
+    if ((err=esp_codec_dev_set_in_channel_gain(microphone,
+            ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),BSP_MIC_GAIN_DB))!=ESP_OK) goto fail;
+    if ((err=esp_codec_dev_set_in_channel_gain(microphone,
+            ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2),BSP_REFERENCE_GAIN_DB))!=ESP_OK) goto fail;
+    output_lock=xSemaphoreCreateMutex(); decoder=opus_dec_create(NULL);
+    if (!output_lock||!decoder) {err=ESP_ERR_NO_MEM;goto fail;}
+    playback_streaming = false;
+    state=AUDIO_OUT_STATE_IDLE;
+    pcm_read=pcm_write=pcm_count=0;
+    stream_open=stream_eof=output_started=false;
+    pcm_received=false; last_pcm_ms=0;
+    stream_drained=true; last_sample=0; voice_samples=received_voice_samples=0; prefill_started_us=0;
+    received_abs_sum=0; received_samples=0;
+    atomic_store(&last_voice_ms,0);
+    atomic_store(&task_exit, false);
+    atomic_store(&task_exited, false);
+    if (xTaskCreatePinnedToCore(playback_worker, "pcm_output", 4096, NULL, 6,
+                                &playback_task, 1) != pdPASS) {
+        err=ESP_ERR_NO_MEM; goto fail;
+    }
+    ESP_LOGI("audio_out", "VoCat audio: 16kHz, TX mono, RX TDM slot0=mic slot1=hardware reference");
+    ESP_LOGI("audio_out", "PCM output: %u ms prefill, %u ms capacity, DMA=60 ms, core=1 priority=6",
+             (unsigned)(PCM_PREFILL / 16), (unsigned)(PCM_CAPACITY / 16));
+    event_bus_publish(EV_AUDIO_OUT_READY,NULL,0);
+    if (callback) callback(AUDIO_OUT_EVENT_INIT_OK,callback_arg);
+    return ESP_OK;
+fail:
+    audio_out_deinit(); state=AUDIO_OUT_STATE_ERROR; return err;
+}
+
+esp_err_t audio_out_deinit(void)
+{
+    if (playback_task) {
+        atomic_store(&task_exit, true);
+        while (!atomic_load(&task_exited)) vTaskDelay(1);
+        playback_task=NULL;
+    }
+    if (decoder) {opus_dec_destroy(decoder);decoder=NULL;}
+    if (speaker) {esp_codec_dev_close(speaker);esp_codec_dev_delete(speaker);speaker=NULL;}
+    if (microphone) {esp_codec_dev_close(microphone);esp_codec_dev_delete(microphone);microphone=NULL;}
+    if (dac_if) {audio_codec_delete_codec_if(dac_if);dac_if=NULL;}
+    if (adc_if) {audio_codec_delete_codec_if(adc_if);adc_if=NULL;}
+    if (dac_ctrl) {audio_codec_delete_ctrl_if(dac_ctrl);dac_ctrl=NULL;}
+    if (adc_ctrl) {audio_codec_delete_ctrl_if(adc_ctrl);adc_ctrl=NULL;}
+    if (gpio_if) {audio_codec_delete_gpio_if(gpio_if);gpio_if=NULL;}
+    if (data_if) {audio_codec_delete_data_if(data_if);data_if=NULL;}
+    if (tx) {i2s_channel_disable(tx);i2s_del_channel(tx);tx=NULL;}
+    if (rx) {i2s_channel_disable(rx);i2s_del_channel(rx);rx=NULL;}
+    if (output_lock) {vSemaphoreDelete(output_lock);output_lock=NULL;}
+    playback_streaming = false;
+    state=AUDIO_OUT_STATE_NONE; return ESP_OK;
+}
+
+esp_err_t audio_out_set_volume(int volume)
+{
+    if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
+    if (!speaker || !output_lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(output_lock, portMAX_DELAY);
+    esp_err_t err = esp_codec_dev_set_out_vol(speaker, volume);
+    if (err == ESP_OK) atomic_store(&output_volume, volume);
+    xSemaphoreGive(output_lock);
+    return err;
+}
+
+int audio_out_get_volume(void)
+{
+    return atomic_load(&output_volume);
+}
+
+/* All PCM state and hardware writes are serialized by output_lock.
+ * The output task continuously clocks silence too; an empty network queue never
+ * leaves stale DMA audio repeating. AEC reference comes from ES7210 hardware
+ * input; cancellation must keep these shared RX/TX clocks running. */
+static esp_err_t write_block(int16_t *mono)
+{
+    int64_t start=esp_timer_get_time();
+    esp_err_t err=esp_codec_dev_write(speaker,mono,PCM_BLOCK*sizeof(int16_t));
+    uint32_t elapsed=(uint32_t)(esp_timer_get_time()-start);
+    if (elapsed>write_max_us) write_max_us=elapsed;
+    return err;
+}
+static void ramp_to_zero(int16_t *mono, size_t from)
+{
+    int16_t previous=from ? mono[from-1] : last_sample;
+    size_t n=PCM_BLOCK-from;
+    for(size_t i=0;i<n;++i) mono[from+i]=pcm_scale(previous,n-i-1,n);
+}
+
+static void measure_pcm_signal(const int16_t *pcm, size_t samples)
+{
+    for (size_t i=0; i<samples; ++i) {
+        int32_t sample=pcm[i]; /* 先扩展，保证 -32768 的绝对值不会溢出。 */
+        uint32_t magnitude=(uint32_t)(sample<0 ? -sample : sample);
+        if(magnitude>signal_peak) signal_peak=magnitude;
+        signal_abs_sum+=magnitude;
+        if(magnitude) ++signal_nonzero;
+    }
+    signal_samples+=(uint32_t)samples;
+}
+
+/* output_lock 已持有。空缓存只结束本次出声，不关闭可继续收音频的会话。 */
+static esp_err_t output_pcm_block(void)
+{
+    int16_t mono[PCM_BLOCK]={0};
+    uint32_t waited_ms=(uint32_t)((esp_timer_get_time()-prefill_started_us)/1000);
+    if(stream_open && !atomic_load(&stop_requested) && !output_started &&
+        pcm_can_start(pcm_count,stream_eof,waited_ms)) {
+        output_started=true;
+        fade_samples=80; /* 5 ms onset ramp */
+    }
+    size_t n=output_started && !atomic_load(&stop_requested) ? pcm_take_count(pcm_count) : 0;
+    uint32_t abs_sum=0;
+    for(size_t i=0;i<n;++i) {
+        mono[i]=pcm_ring[pcm_read]; pcm_read=(pcm_read+1)%PCM_CAPACITY;
+        abs_sum+=(uint32_t)abs((int)mono[i]); /* 在起播淡入与硬件音量之前判定活动。 */
+        if(fade_samples) { mono[i]=pcm_scale(mono[i],80-fade_samples,80); --fade_samples; }
+    }
+    pcm_count-=n;
+    supplied_samples+=n;
+    if(output_started && n<PCM_BLOCK) {
+        if(!stream_eof) ++underruns;
+        ramp_to_zero(mono,n);
+        output_started=false;
+    }
+    bool voice=pcm_voice_update(&voice_samples,abs_sum,n);
+    esp_err_t err=write_block(mono);
+    last_sample=mono[PCM_BLOCK-1];
+    uint32_t now_ms=(uint32_t)(esp_timer_get_time()/1000);
+    if(err==ESP_OK && voice) {
+        /* 保留 0 作为无活动；时钟回绕瞬间使用前一毫秒。 */
+        atomic_store(&last_voice_ms,now_ms ? now_ms : UINT32_MAX);
+    }
+    if(!pcm_count && n==0) {
+        if(drain_blocks<=PCM_DMA_BLOCKS) ++drain_blocks;
+        if(drain_blocks>PCM_DMA_BLOCKS) {
+            stream_drained=true; output_started=false;
+            if(stream_eof) stream_open=false;
+            state=AUDIO_OUT_STATE_IDLE;
+        }
+    } else {
+        drain_blocks=0;
+        stream_drained=false;
+        if(n) state=AUDIO_OUT_STATE_PLAYING;
+    }
+    if(err!=ESP_OK) { state=AUDIO_OUT_STATE_ERROR; stream_drained=true; }
+    /* 入队即开始显示；停止收包后，保持窗和 PCM/DMA 尾音都结束才回监听。
+     * 单独的 received 标记允许时间戳为 0，并以无符号差处理毫秒回绕。 */
+    bool playing=err==ESP_OK && !atomic_load(&stop_requested) && pcm_received &&
+        (!stream_drained || (uint32_t)(now_ms-last_pcm_ms)<PCM_UI_HOLD_MS);
+    if(!playing) pcm_received=false; /* 保持期已过/已停止，不让旧时间戳回绕后再次点亮。 */
+    bool was_playing=atomic_exchange(&playback_streaming,playing);
+    if(playing && !was_playing) event_bus_publish(EV_AUDIO_OUT_START,NULL,0);
+    return err;
+}
+
+static void playback_worker(void *arg)
+{
+    (void)arg;
+    while(!atomic_load(&task_exit)) {
+        xSemaphoreTake(output_lock,portMAX_DELAY);
+        esp_err_t err=output_pcm_block();
+        int64_t now=esp_timer_get_time();
+        bool report=stream_open && now-stats_at>=5000000;
+        size_t buffered=pcm_count;
+        uint32_t gaps=underruns, dec=decode_max_us, wr=write_max_us, samples=supplied_samples;
+        uint32_t dec_total=decode_total_us, dec_audio=decode_samples, dec_slow=decode_over_budget;
+        uint32_t peak=signal_peak, mean=signal_samples ? (uint32_t)(signal_abs_sum/signal_samples) : 0;
+        if(report) {
+            stats_at=now; decode_max_us=write_max_us=0;
+            decode_total_us=decode_samples=decode_over_budget=0;
+        }
+        xSemaphoreGive(output_lock);
+        if(report) ESP_LOGI("audio_out", "Playback stats: buffered_ms=%u starvations=%lu decode_max_us=%lu write_max_us=%lu pcm_ms=%lu "
+            "decode_work_ms=%lu decode_audio_ms=%lu decode_slow=%lu pcm_peak=%lu pcm_mean_abs=%lu",
+            (unsigned)(buffered/16),(unsigned long)gaps,(unsigned long)dec,(unsigned long)wr,(unsigned long)(samples/16),
+            (unsigned long)(dec_total/1000),(unsigned long)(dec_audio/16),(unsigned long)dec_slow,
+            (unsigned long)peak,(unsigned long)mean);
+        if(err!=ESP_OK) { event_bus_publish(EV_AUDIO_INPUT_ERROR,NULL,0); vTaskDelay(pdMS_TO_TICKS(20)); }
+        /* Fairness between blocks even if DMA has several free descriptors. */
+        vTaskDelay(1);
+    }
+    atomic_store(&task_exited,true);
+    vTaskDelete(NULL);
+}
+
+/* Bounded producer backpressure. The WS worker owns the decoder and serializes
+ * this call with cancellation. A packet is at most 120 ms of mono PCM. */
+esp_err_t audio_out_write(const int16_t *pcm_data,size_t pcm_len)
+{
+    if(!speaker||!output_lock) return ESP_ERR_INVALID_STATE;
+    if(!pcm_data||pcm_len%sizeof(int16_t)) return ESP_ERR_INVALID_ARG;
+    size_t pos=0,total=pcm_len/sizeof(int16_t);
+    int64_t deadline=esp_timer_get_time()+2000000;
+    while(pos<total) {
+        xSemaphoreTake(output_lock,portMAX_DELAY);
+        if(atomic_load(&stop_requested) || !stream_open || stream_eof || state==AUDIO_OUT_STATE_ERROR) {
+            xSemaphoreGive(output_lock); return ESP_ERR_INVALID_STATE;
+        }
+        if(!pcm_count && !output_started) prefill_started_us=esp_timer_get_time();
+        stream_drained=false;
+        size_t before=pos;
+        bool voice=false;
+        uint32_t now_ms=(uint32_t)(esp_timer_get_time()/1000);
+        if(!pcm_received || (uint32_t)(now_ms-last_pcm_ms)>PCM_PREFILL_WAIT_MS) {
+            received_voice_samples=received_abs_sum=0;
+            received_samples=0; /* 分离的短噪声不能跨断流累计成有效声音。 */
+        }
+        while(pos<total && pcm_count<PCM_CAPACITY) {
+            int32_t sample=pcm_data[pos++];
+            received_abs_sum+=(uint32_t)(sample<0 ? -sample : sample);
+            if(++received_samples==PCM_BLOCK) {
+                /* 与实际输出一样按 10 ms 检测，不把整包平均值当连续人声。 */
+                voice=pcm_voice_update(&received_voice_samples,received_abs_sum,PCM_BLOCK) || voice;
+                received_abs_sum=0; received_samples=0;
+            }
+            pcm_ring[pcm_write]=(int16_t)sample;
+            pcm_write=(pcm_write+1)%PCM_CAPACITY; ++pcm_count;
+        }
+        if(pos>before) {
+            pcm_received=true;
+            last_pcm_ms=now_ms;
+            /* 新有效声音入队即取消待机，避免在 30 秒临界点因预填/排队误挂。
+             * 输出任务播放有效尾音时继续续期；静音包不刷新这个时间。 */
+            if(voice)
+                atomic_store(&last_voice_ms,last_pcm_ms ? last_pcm_ms : UINT32_MAX);
+        }
+        xSemaphoreGive(output_lock);
+        if(pos<total) {
+            if(esp_timer_get_time()>deadline) return ESP_ERR_TIMEOUT;
+            vTaskDelay(1);
+        }
+    }
+    return ESP_OK;
+}
+esp_err_t audio_out_read_afe_input(int16_t *pcm,size_t bytes)
+{return microphone?esp_codec_dev_read(microphone,pcm,bytes):ESP_ERR_INVALID_STATE;}
+
+void audio_out_set_streaming(bool active)
+{
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    bool report=!active && stream_open && !stream_eof;
+    if(active && !stream_open) {
+        pcm_read=pcm_write=pcm_count=0;
+        stream_open=true; stream_eof=false; stream_drained=false; output_started=false;
+        drain_blocks=0; underruns=supplied_samples=decoded_packets=decode_max_us=write_max_us=0;
+        decode_total_us=decode_samples=decode_over_budget=0;
+        signal_peak=signal_samples=signal_nonzero=0; signal_abs_sum=0;
+        stats_at=esp_timer_get_time(); state=AUDIO_OUT_STATE_IDLE;
+        prefill_started_us=stats_at; voice_samples=received_voice_samples=0;
+        received_abs_sum=0; received_samples=0;
+        pcm_received=false; last_pcm_ms=0;
+        atomic_store(&playback_streaming,false);
+        atomic_store(&last_voice_ms,0);
+    } else if(active && stream_eof) {
+        /* 同一回复的下一音频段：撤销 EOF，保留尚未播出的 PCM 和 DMA 尾音。
+         * 不能清空环形队列，否则工具调用前后的短段会被截断。 */
+        stream_eof=false; stream_drained=false; drain_blocks=0;
+    } else if(!active) {
+        stream_eof=true; drain_blocks=0; /* flush even replies shorter than prefill */
+    }
+    uint32_t peak=signal_peak, samples=signal_samples, nonzero=signal_nonzero;
+    uint32_t mean=samples ? (uint32_t)(signal_abs_sum/samples) : 0;
+    int volume=atomic_load(&output_volume);
+    xSemaphoreGive(output_lock);
+    /* 短于 5 秒的提醒也有摘要，便于区分静音数据、音量为零与输出链路问题。 */
+    if(report) ESP_LOGI("audio_out", "PCM signal at EOF: decoded_ms=%lu peak=%lu mean_abs=%lu nonzero=%lu/%lu volume=%d",
+        (unsigned long)(samples/(AUDIO_OUT_SAMPLE_RATE/1000)),(unsigned long)peak,(unsigned long)mean,
+        (unsigned long)nonzero,(unsigned long)samples,volume);
+}
+bool audio_out_is_streaming(void)
+{ return !atomic_load(&stop_requested) && atomic_load(&playback_streaming); }
+uint32_t audio_out_get_last_voice_ms(void) { return atomic_load(&last_voice_ms); }
+bool audio_out_is_drained(void)
+{
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    bool done=stream_drained && state!=AUDIO_OUT_STATE_ERROR;
+    xSemaphoreGive(output_lock);
+    return done;
+}
+int audio_out_play_opus(const uint8_t *data,size_t len)
+{
+    if(!decoder||!data||!len) return -1;
+    int64_t start=esp_timer_get_time();
+    int samples=opus_dec_decode(decoder,data,len,decode_pcm,sizeof(decode_pcm));
+    uint32_t elapsed=(uint32_t)(esp_timer_get_time()-start);
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    if(elapsed>decode_max_us) decode_max_us=elapsed;
+    decode_total_us+=elapsed;
+    if(samples>0) {
+        measure_pcm_signal(decode_pcm,(size_t)samples);
+        decode_samples+=(uint32_t)samples;
+        if(elapsed>(uint32_t)samples*1000000u/AUDIO_OUT_SAMPLE_RATE) ++decode_over_budget;
+    }
+    ++decoded_packets;
+    xSemaphoreGive(output_lock);
+    if(samples>0 && audio_out_write(decode_pcm,samples*sizeof(int16_t))!=ESP_OK) return -1;
+    return samples;
+}
+esp_err_t audio_out_stop(void)
+{
+    if(!output_lock) return ESP_ERR_INVALID_STATE;
+    /* 在清理开始时消费请求，清理期间到达的新请求留给下一次 worker。 */
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    atomic_store(&stop_requested,false);
+    pcm_read=pcm_write=pcm_count=0;
+    stream_open=false; stream_eof=false; output_started=false;
+    pcm_received=false; last_pcm_ms=0;
+    atomic_store(&playback_streaming,false);
+    atomic_store(&last_voice_ms,0); voice_samples=received_voice_samples=0; prefill_started_us=0;
+    received_abs_sum=0; received_samples=0;
+    int16_t mono[PCM_BLOCK]={0};
+    ramp_to_zero(mono,0);
+    esp_err_t err=write_block(mono);
+    memset(mono,0,sizeof(mono));
+    /* Leave shared RX/TX clocks running. Flush the DMA horizon with zeros,
+     * so no old answer can leak into the next turn after this returns. */
+    for(unsigned i=0;i<=PCM_DMA_BLOCKS && err==ESP_OK;++i) err=write_block(mono);
+    last_sample=0; stream_drained=true;
+    state=err==ESP_OK?AUDIO_OUT_STATE_IDLE:AUDIO_OUT_STATE_ERROR;
+    xSemaphoreGive(output_lock);
+    return err;
+}
+void audio_out_request_stop(void) { atomic_store(&stop_requested,true); }
+bool audio_out_stop_requested(void) { return atomic_load(&stop_requested); }
+esp_err_t audio_out_clear_queue(void) { return audio_out_stop(); }
+audio_out_state_t audio_out_get_state(void) { return atomic_load(&state); }
+void audio_out_set_event_cb(audio_out_event_cb_t cb,void *arg) {callback=cb;callback_arg=arg;}
+void audio_out_dump_stats(void) {ESP_LOGI("audio_out","state=%d",atomic_load(&state));}

@@ -1,0 +1,154 @@
+/**
+ * proto_service.h -- Full-duplex gateway JSON parsing & construction.
+ *
+ *   - JSON parser: cJSON，按对象层级读取字段；结果持有有界副本。
+ *   - Frame builders:
+ *       auth                       (first message after WebSocket open)
+ *       input_audio_buffer.append  (Opus, Base64 in JSON text frame)
+ *
+ *   Spec (ACOS API V1):
+ *     - Upload: WebSocket text frame, Base64 Opus inside "audio" field,
+ *               "encoding":"opus". Recommended 20 ms / 320 samples.
+ *     - Download: WebSocket binary frame, raw Opus (60 ms / 960 samples).
+ *
+ *   Server -> Client JSON events:
+ *     __proxy_connected__, input_audio_buffer.speech_started,
+ *     input_audio_buffer.speech_stopped, response.audio.done, error.
+ *   Speech start/stop supplies the idle timer's user-speaking state. Speech
+ *   and response notifications never gate the continuous binary audio stream.
+ *
+ *   Dependencies: cJSON (implementation only).
+ */
+
+#ifndef PROTO_SERVICE_H
+#define PROTO_SERVICE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- Parse result codes ------------------------------------------------- */
+typedef enum {
+    PROTO_OK                =  0,
+    PROTO_ERR_INVALID_JSON  = -1,
+    PROTO_ERR_NO_TYPE       = -2,
+    PROTO_ERR_PARSE_FIELD   = -3,
+    PROTO_ERR_UNKNOWN_TYPE  = -4,
+} proto_result_t;
+
+/* ---- ACOS V1 server event IDs -------------------------------------------- */
+typedef enum {
+    PROTO_EVT_UNKNOWN              = 0,
+    /* auth / handshake */
+    PROTO_EVT_PROXY_CONNECTED      = 1,  /* __proxy_connected__ */
+    PROTO_EVT_ERROR                = 2,  /* error */
+    /* VAD events from server */
+    PROTO_EVT_SPEECH_STARTED       = 3,  /* input_audio_buffer.speech_started */
+    PROTO_EVT_SPEECH_STOPPED       = 4,  /* input_audio_buffer.speech_stopped */
+    /* AI reply lifecycle */
+    PROTO_EVT_RESPONSE_DONE        = 5,  /* response.audio.done */
+    PROTO_EVT_RESPONSE_TERMINAL    = 6,  /* response.done / explicit cancelled */
+    /* 可选兼容事件；ACOS V1 文档未保证平台发送这些扩展。 */
+    PROTO_EVT_RESPONSE_CREATED     = 7,
+    PROTO_EVT_RESPONSE_TOOL        = 8,
+    PROTO_EVT_RESPONSE_MESSAGE     = 9,
+} proto_event_t;
+
+/* ---- Parsed message (owns its strings; no JSON/cJSON lifetime dependency) -- */
+typedef struct {
+    proto_event_t  evt;             /* mapped event id                       */
+    char           raw_type[80];
+    int            raw_type_len;
+
+    /* error frame */
+    int            error_code;
+    char           error_code_text[80];
+    int            error_code_text_len;
+    char           error_msg[193]; /* 仅错误说明允许截短，不参与 ID 匹配 */
+    int            error_msg_len;
+
+} proto_msg_t;
+
+/* ---- Public API --------------------------------------------------------- */
+
+/* HTTP 下发和 WS 发送共用长度上限；凭据以字节计，不允许静默截短。 */
+#define PROTO_WS_URL_MAX 1024
+#define PROTO_AUTH_TOKEN_MAX 2048
+#define PROTO_AUTH_FRAME_SIZE (PROTO_AUTH_TOKEN_MAX * 6 + 32)
+#define PROTO_REMINDER_TASK_IDS_MAX 8u
+#define PROTO_REMINDER_AUTH_FRAME_SIZE \
+    (PROTO_AUTH_TOKEN_MAX * 6 + 64 * 6 + PROTO_REMINDER_TASK_IDS_MAX * (128 * 6 + 4) + 192)
+typedef struct {
+    char url[PROTO_WS_URL_MAX + 1];
+    char token[PROTO_AUTH_TOKEN_MAX + 1];
+} proto_ws_credentials_t;
+
+/* 仅识别已知鉴权错误码，不根据可能包含业务正文的 message 猜测。 */
+bool proto_is_auth_error(const proto_msg_t *msg);
+
+/**
+ * @brief Parse one JSON text frame into msg.
+ * @param json_str NUL-terminated JSON string.
+ * @param msg      output, caller-owned.
+ */
+proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg);
+/* 接收侧低频控制帧快通道，只返回精确的 speech_started/stopped。
+ * 无效 JSON、重复字段、转录别名及其他事件返回 UNKNOWN，不分配 proto_msg_t。 */
+proto_event_t proto_parse_speech_event(const char *json_str);
+
+/**
+ * @brief Build `auth` JSON frame (first message after WebSocket open).
+ *
+ *   Format: {"type":"auth","token":"<token>"}
+ *
+ * @param buf       output buffer
+ * @param buf_size  buffer size
+ * @param token     网关下发的 token；仅旧配置模式使用静态 API Key
+ * @return          length written (>=0), 0 on failure
+ */
+size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token);
+/* Reminder sessions carry device identity and the platform task IDs in auth. */
+size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
+                                       const char *device_id,
+                                       const char *const *task_ids, size_t task_count);
+
+/**
+ * @brief Build `input_audio_buffer.append` JSON frame.
+ *
+ *   Format:
+ *     {"event_id":"event_<ms>_<rand>","type":"input_audio_buffer.append",
+ *      "audio":"<base64>","encoding":"opus"}
+ *
+ * @param buf           output buffer (must fit JSON + base64 string)
+ * @param buf_size      buffer size
+ * @param base64_audio  pre-encoded Base64 Opus payload (NUL-terminated)
+ * @param event_id      optional event_id string (NULL = auto-generate)
+ * @return              length written (>=0), 0 on failure
+ */
+size_t proto_build_input_audio_append(char *buf, size_t buf_size,
+                                       const char *base64_audio,
+                                       const char *event_id);
+
+/**
+ * @brief Helper: produce a unique event_id string.
+ *   Format: "event_<ms>_<6hex>"
+ *
+ * @param buf       output buffer (>= 32 bytes)
+ * @param buf_size  buffer size
+ */
+void proto_make_event_id(char *buf, size_t buf_size);
+
+/**
+ * @brief Map proto_event_t to human-readable name (debug only).
+ */
+const char *proto_event_name(proto_event_t evt);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PROTO_SERVICE_H */
