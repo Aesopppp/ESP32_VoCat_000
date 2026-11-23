@@ -6,6 +6,7 @@
 #include "cfg_service.h"
 #include "board_config.h"
 #include "esp_crt_bundle.h"
+#include "tls_trust_anchor.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
@@ -388,7 +389,12 @@ static esp_websocket_client_handle_t create_client(const char *uri)
     esp_websocket_client_config_t cfg = {
         .uri = uri, .disable_auto_reconnect = true, .network_timeout_ms = 10000,
         .task_stack = 6144, /* 有界 JSON 解析和协议字段副本，避免默认栈过紧。 */
+#ifdef DEVICE_PLATFORM_TLS_CA
+        .crt_bundle_attach = NULL,
+        .ca_cert = tls_trust_anchor_ca_pem(),
+#else
         .crt_bundle_attach = esp_crt_bundle_attach,
+#endif
         /* WebSocket-level keepalive: send a ping every 20s so server idle timeout
          * does not silently close the connection. PONG timeout 30s before we
          * declare the link dead. (esp_websocket_client v1.8.0) */

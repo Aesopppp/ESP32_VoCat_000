@@ -14,6 +14,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "tls_trust_anchor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -144,7 +145,12 @@ static bool http_begin(void *context, const char *url, const device_handshake_he
         .keep_alive_enable = false,
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
+#ifdef DEVICE_PLATFORM_TLS_CA
+        .crt_bundle_attach = NULL,
+        .ca_cert = tls_trust_anchor_ca_pem(),
+#else
         .crt_bundle_attach = esp_crt_bundle_attach,
+#endif
     };
     http->client = esp_http_client_init(&config);
     if (!http->client) return false;
@@ -313,7 +319,12 @@ void device_handshake_service_poll(bool network_available)
         s_seen_epoch = epoch;
         device_handshake_network_changed(&s_schedule, network_available);
         atomic_store(&s_cancel_generation, s_schedule.generation);
-        clear_snapshot();
+        /* 不在这里 clear_snapshot()：network_changed() 已经把 ready 置 false，
+         * get_configuration() 会拒绝旧凭据，不会误用。但 token 本身可能还有效
+         * （TTL 1h，WiFi 抖动常常只有几秒）——清掉会逼唤醒时重做一次完整
+         * HTTPS 握手（实测额外 ~11s：TLS 6.4s + 设备空等 4.5s）。
+         * 新结果到达时 clear_snapshot() 会替换旧快照；被平台拒绝时下面清。 */
+        if (s_schedule.blocked) clear_snapshot();
     }
     handshake_attempt_t *finished = NULL;
     if (s_results && xQueueReceive(s_results, &finished, 0) == pdTRUE) {

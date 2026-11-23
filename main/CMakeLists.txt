@@ -32,6 +32,7 @@ idf_component_register(
         "device_mqtt_service.c"
         "log_service.c"
         "provisioning_service.c"
+        "tls_trust_anchor.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_codec_dev
@@ -76,6 +77,17 @@ if(EXISTS "${device_mqtt_ca}")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE DEVICE_MQTT_HAS_CA=1)
 else()
     message(WARNING "MQTT disabled until main/certs/device_mqtt_ca.pem is supplied")
+endif()
+
+# 平台 HTTPS/WSS 入口的自定义信任根（ISRG Root X2）。
+# 用它代替 esp_crt_bundle_attach：省掉 ~140 张 CA 的解析和 3 次 ECDSA P-384
+# 验签，实测每次握手 2.7s→~0.3s。证书随代码发布（公开根，无私钥）。
+set(platform_tls_ca "${CMAKE_CURRENT_SOURCE_DIR}/certs/platform_tls_ca.pem")
+if(EXISTS "${platform_tls_ca}")
+    target_add_binary_data(${COMPONENT_LIB} "${platform_tls_ca}" TEXT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DEVICE_PLATFORM_TLS_CA=1)
+else()
+    message(WARNING "platform_tls_ca.pem missing; falling back to full CA bundle (slow)")
 endif()
 
 # Suppress warnings from IDF headers in third-party code
