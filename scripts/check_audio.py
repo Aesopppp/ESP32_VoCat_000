@@ -47,7 +47,9 @@ def main():
         ("audio_buffer_frames_locked", "discard_oldest_audio_locked", "clear_audio_buffer_locked",
          "afe_frame_energy", "buffer_afe_audio", "wake_word_set_audio_buffer_enabled",
          "wake_word_set_pre_roll", "wake_word_mark_wake_boundary",
-         "wake_word_discard_audio_before")), encoding="utf-8")
+         "wake_word_discard_audio_before", "wake_word_get_wake_boundary_sample",
+         "wake_word_set_preroll_replay_end", "wake_word_finish_pre_roll_replay",
+         "wake_word_get_preroll_replay_end")), encoding="utf-8")
     cases = {
         "wifi-audio-checks": ["-Itests/audio_host", "-Iwork/speech-handoff",
                               "tests/audio_host/wifi_audio_checks.c"],

@@ -130,6 +130,17 @@ void wake_word_set_audio_buffer_enabled(bool enabled);
  *  false = 旧行为（仅 LISTENING / PLAYING 入队，模式切换清空）。 */
 void wake_word_set_pre_roll(bool enabled);
 
+/** 会话开始时记录 pre-roll 补发的截止采样位置（当前 written_end）。
+ *  截止之前的历史音频用长 FIFO 补发，读完截止点后切到实时短缓冲。 */
+void wake_word_set_preroll_replay_end(uint32_t replay_end_sample);
+
+/** audio_in 补发到截止点后调用：切到实时 2 帧缓冲，恢复打断能力。
+ *  不清空 FIFO、不改 AFE 模式。 */
+void wake_word_finish_pre_roll_replay(void);
+
+/** 获取 pre-roll 补发截止采样位置；0 = 未设置（不启用短缓冲切换）。 */
+uint32_t wake_word_get_preroll_replay_end(void);
+
 /** 会话开始时裁掉指定采样位置之前的旧音频（唤醒词本身）。
  *  only drops frames fully below `sample_end`; the frame that straddles the
  *  boundary is retained so the first spoken word is not cut in half. */
@@ -137,6 +148,9 @@ void wake_word_discard_audio_before(uint32_t sample_end);
 
 /** 下一次 AFE 模式切换完成时记录采样位置，供 start_audio_session 裁剪使用。 */
 void wake_word_mark_wake_boundary(void);
+
+/** 获取 wake_word_mark_wake_boundary() 记录的唤醒边界采样位置。 */
+uint32_t wake_word_get_wake_boundary_sample(void);
 
 /**
  * @brief 获取 AFE fetch 帧大小（samples）

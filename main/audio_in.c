@@ -343,6 +343,14 @@ static void audio_in_task(void *param)
         size_t samples_read = item_size_out / sizeof(int16_t);
         uint32_t ts = (uint32_t)(esp_log_timestamp());
 
+        /* pre-roll 历史音频补发完毕：切到实时短缓冲，恢复平台打断能力。
+         * sample_end 是本帧末端采样位置；截止点由 start_audio_session 记录。 */
+        uint32_t replay_end = wake_word_get_preroll_replay_end();
+        if (replay_end && sample_end >= replay_end) {
+            wake_word_finish_pre_roll_replay();
+            wake_word_set_preroll_replay_end(0);
+        }
+
         /* PCM 回调 */
         if (h->pcm_cb) {
             h->pcm_cb(h->pcm_cb_arg, frame_buf, item_size_out, ts);

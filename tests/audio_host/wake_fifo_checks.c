@@ -22,6 +22,8 @@ static RingbufHandle_t s_ringbuf=(void*)1;
 static SemaphoreHandle_t s_audio_buffer_lock=(void*)2;
 static bool s_audio_buffer_enabled=true;
 static bool s_pre_roll_enabled=false;
+static uint32_t s_preroll_end_sample=0;
+static bool s_preroll_drained=false;
 static uint32_t s_wake_boundary_sample=0;
 static int s_fetch_chunksize=512;
 static wake_word_audio_progress_t s_audio_progress;
@@ -76,6 +78,12 @@ int main(void)
     current=APP_STATE_PLAYING;
     for(unsigned i=0;i<30;++i) buffer_afe_audio(&res);
     CHECK(queued==16); /* 普通全双工仍保留原有 512 ms 上限。 */
+    /* 方案 A：pre-roll 补发完毕后切到 2 帧实时缓冲，避免打断失效。 */
+    wake_word_set_preroll_replay_end(s_audio_progress.written_end);
+    wake_word_finish_pre_roll_replay();
+    CHECK(wake_word_get_preroll_replay_end()==s_audio_progress.written_end);
+    for(unsigned i=0;i<30;++i) buffer_afe_audio(&res);
+    CHECK(queued==2); /* 补发后只留 2 帧实时缓冲。 */
     CHECK(s_audio_progress.written_end > 0 && s_audio_progress.read_end > 0);
     test_time_us=(int64_t)UINT32_MAX*1000+1000;
     buffer_afe_audio(&res); CHECK(s_audio_progress.last_voice_ms==UINT32_MAX);

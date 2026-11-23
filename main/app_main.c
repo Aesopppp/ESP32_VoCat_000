@@ -274,9 +274,14 @@ static void start_audio_session(const char *reason)
     }
     /* pre-roll 只裁掉唤醒词本身，保留其后第一句话；非 pre-roll 路径仍整段清空。 */
     if (s_pre_roll_used) {
-        wake_word_discard_audio_before(s_wake_boundary_sample);
+        wake_word_discard_audio_before(wake_word_get_wake_boundary_sample());
     } else {
         wake_word_clear_audio_buffer();
+    }
+    if (s_pre_roll_used) {
+        wake_word_audio_progress_t progress;
+        wake_word_get_audio_progress(&progress);
+        wake_word_set_preroll_replay_end(progress.written_end);
     }
     if (app_state_start_listening() != ESP_OK) {
         recover_session("could not start audio upload");

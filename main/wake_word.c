@@ -71,6 +71,8 @@ static int s_fetch_chunksize = 0;
 static SemaphoreHandle_t s_audio_buffer_lock;
 static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；会话内一直允许连续上传。 */
 static volatile bool s_pre_roll_enabled = false;
+static volatile uint32_t s_preroll_end_sample = 0;
+static volatile bool s_preroll_drained = false;
 static uint32_t s_wake_boundary_sample = 0;
 static wake_word_audio_progress_t s_audio_progress;
 static uint32_t s_overflow_log_ms;
@@ -110,6 +112,8 @@ static void clear_audio_buffer_locked(void)
     while (discard_oldest_audio_locked()) {}
     memset(&s_audio_progress, 0, sizeof(s_audio_progress));
     s_overflow_frames = 0;
+    s_preroll_end_sample = 0;
+    s_preroll_drained = false;
 }
 
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress)
@@ -160,7 +164,11 @@ static void buffer_afe_audio(const afe_fetch_result_t *res)
         return;
     }
     size_t dropped = 0;
-    const size_t max_frames = (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
+    /* pre-roll 补发阶段用长 FIFO 保存连接期间攒下的历史音频；补发完毕后
+     * 缩到 2 帧实时缓冲，避免旧音频积压把平台 speech_started 状态卡住。 */
+    const size_t max_frames = s_preroll_drained
+        ? 2u
+        : (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
     while (audio_buffer_frames_locked() >= max_frames && discard_oldest_audio_locked())
         ++dropped;
     bool stored;
@@ -604,6 +612,33 @@ void wake_word_mark_wake_boundary(void)
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     s_wake_boundary_sample = s_audio_progress.written_end;
     xSemaphoreGive(s_audio_buffer_lock);
+}
+
+uint32_t wake_word_get_wake_boundary_sample(void)
+{
+    return s_wake_boundary_sample;
+}
+
+void wake_word_set_preroll_replay_end(uint32_t replay_end_sample)
+{
+    if (!s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    s_preroll_end_sample = replay_end_sample;
+    if (replay_end_sample) s_preroll_drained = false;
+    xSemaphoreGive(s_audio_buffer_lock);
+}
+
+void wake_word_finish_pre_roll_replay(void)
+{
+    if (!s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    s_preroll_drained = true;
+    xSemaphoreGive(s_audio_buffer_lock);
+}
+
+uint32_t wake_word_get_preroll_replay_end(void)
+{
+    return s_preroll_end_sample;
 }
 
 void wake_word_discard_audio_before(uint32_t sample_end)
