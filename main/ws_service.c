@@ -4,6 +4,7 @@
 #include "ws_rx_policy.h"
 #include "event_bus.h"
 #include "cfg_service.h"
+#include "wifi_service.h"
 #include "latency_log.h"
 #include "board_config.h"
 #include "esp_crt_bundle.h"
@@ -19,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <netdb.h>
 
 static const char *TAG = "ws_service";
 static esp_websocket_client_handle_t client;
@@ -27,6 +29,9 @@ static atomic_uint generation = 1;
 static bool client_started;
 static proto_ws_credentials_t *credentials; /* 主任务设置；RX 仅在 playback_lock 下读取。 */
 static bool credentials_from_handshake;
+static char prepared_url[PROTO_WS_URL_MAX + 1];
+static char prepared_token[PROTO_AUTH_TOKEN_MAX + 1];
+static char client_url[PROTO_WS_URL_MAX + 1];
 static uint8_t *frame;
 static size_t frame_size, received;
 static int opcode;
@@ -435,6 +440,69 @@ static void release_credentials(proto_ws_credentials_t *value)
     volatile unsigned char *p = (volatile unsigned char *)value;
     for (size_t i = 0; i < sizeof(*value); ++i) p[i] = 0;
     free(value);
+}
+
+static void warm_up_dns(const char *url)
+{
+    const char *host = strstr(url, "://");
+    if (host) host += 3;
+    else host = url;
+    const char *path = strchr(host, '/');
+    size_t length = path ? (size_t)(path - host) : strlen(host);
+    const char *port = strrchr(host, ':');
+    if (port && port > host && port < host + length) length = (size_t)(port - host);
+    if (!length || length > 253) return;
+    char hostname[254];
+    memcpy(hostname, host, length); hostname[length] = 0;
+    struct addrinfo *resolved = NULL;
+    if (getaddrinfo(hostname, NULL, NULL, &resolved) == 0 && resolved)
+        freeaddrinfo(resolved);
+    latency_log_standby_event("ws-dns-warmed", (uint32_t)(esp_timer_get_time() / 1000));
+    ESP_LOGI(TAG, "WebSocket DNS warmed: host=%s", hostname);
+}
+
+esp_err_t ws_service_prepare_connection(const char *url, const char *token)
+{
+    if (!client || client_started || state != WS_STATE_DISCONNECTED ||
+        wifi_service_get_state() == WIFI_STATE_IDLE) return ESP_ERR_INVALID_STATE;
+    if (!url || !token || !*url || !*token || strlen(url) > PROTO_WS_URL_MAX ||
+        strlen(token) > PROTO_AUTH_TOKEN_MAX) return ESP_ERR_INVALID_ARG;
+    if (credentials && strcmp(credentials->url, url) == 0 &&
+        strcmp(credentials->token, token) == 0) return ESP_OK;
+    if (!client_url[0]) {
+        cfg_service_get_str(CFG_KEY_WS_URL, client_url, sizeof(client_url), ACOS_WS_URL);
+    }
+    if (strcmp(prepared_url, url) == 0 && strcmp(prepared_token, token) == 0 &&
+        !credentials && strcmp(client_url, url) == 0) {
+        return ESP_OK;
+    }
+    if (!prepared_url[0] && strcmp(client_url, url) == 0) {
+        strcpy(prepared_url, url);
+        strcpy(prepared_token, token);
+        warm_up_dns(url);
+        return ESP_OK;
+    }
+    if (strcmp(client_url, url) != 0) {
+        esp_websocket_client_handle_t replacement = create_client(url);
+        if (!replacement) return ESP_ERR_NO_MEM;
+        esp_err_t err = esp_websocket_client_destroy(client);
+        if (err != ESP_OK) {
+            esp_websocket_client_destroy(replacement);
+            return err;
+        }
+        client = replacement;
+        snprintf(client_url, sizeof(client_url), "%s", url);
+    }
+    strcpy(prepared_url, url);
+    strcpy(prepared_token, token);
+    warm_up_dns(url);
+    return ESP_OK;
+}
+
+void ws_service_invalidate_prepared(void)
+{
+    prepared_url[0] = 0;
+    prepared_token[0] = 0;
 }
 
 esp_err_t ws_service_set_credentials(const char *url, const char *token)

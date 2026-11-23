@@ -21,6 +21,7 @@ YYYY-MM-DDTHH:MM:SS.mmmZ LAT session=<wake-session-id> event=<event> monotonic_m
 | `first-live-uplink` | 第一包实时音频成功发送 |
 | `speech-stopped` | 平台判定用户说完 |
 | `agent-first-audio` | 设备收到智能体首段音频/响应事件 |
+| `ws-dns-warmed` | 待机阶段完成 WebSocket 域名预解析（`detail=standby`，不属于唤醒会话） |
 
 `session` 由启动随机种子和唤醒时刻单调毫秒组成，一次唤醒内稳定；
 网关房间号目前没有通过 ACOS 协议下发，设备侧不能凭空关联。

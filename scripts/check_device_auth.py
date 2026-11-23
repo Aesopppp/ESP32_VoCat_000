@@ -30,18 +30,24 @@ def main():
     root = Path(__file__).resolve().parents[1]
     output = root / "work/device-ws-auth"
     output.mkdir(parents=True, exist_ok=True)
+    for name in (["ws_service.c.inc"] if (output / "ws_service.c.inc").exists() else []):
+        (output / name).unlink()
     groups = {
         "device_handshake_service.c": ("release_attempt", "clear_snapshot",
             "device_handshake_service_get_configuration",
             "device_handshake_service_is_enabled", "device_handshake_service_renew_credentials",
             "device_handshake_service_prepare_websocket", "device_handshake_service_poll"),
         "ws_service.c": ("release_credentials", "ws_service_set_credentials", "ws_service_authenticate"),
-        "app_main.c": ("handle_voice_auth_failure", "retry_voice_connection"),
+        "app_main.c": ("handle_voice_auth_failure", "handle_network_changed", "prepare_standby_websocket", "retry_voice_connection"),
     }
     for file, names in groups.items():
         source = (root / "main" / file).read_text(encoding="utf-8")
         (output / (file + ".inc")).write_text(
             "\n\n".join(extract(source, name) for name in names), encoding="utf-8")
+    auth_source = (root / "main" / "ws_service.c").read_text(encoding="utf-8")
+    prepared_source = "\n\n".join(extract(auth_source, name) for name in
+        ("warm_up_dns", "ws_service_prepare_connection", "ws_service_invalidate_prepared"))
+    (output / "ws_prepared.c.inc").write_text(prepared_source, encoding="utf-8")
     executable = output / "device-auth-checks.exe"
     sources = ["-Itests/audio_host", "-Itests/ui_host", "-Itests/host",
                "-Imanaged_components/espressif__cjson/cJSON", "-Iwork/device-ws-auth",

@@ -43,6 +43,15 @@ void latency_log_event(const char *event, uint32_t monotonic_ms)
     latency_log_event_detail(event, monotonic_ms, NULL, NULL);
 }
 
+void latency_log_standby_event(const char *event, uint32_t monotonic_ms)
+{
+    if (!event) return;
+    char iso[32];
+    aligned_iso(iso, sizeof(iso), monotonic_ms);
+    printf("%s LAT event=%s monotonic_ms=%lu detail=standby\n",
+           iso, event, (unsigned long)monotonic_ms);
+}
+
 void latency_log_event_detail(const char *event, uint32_t monotonic_ms,
                               const char *room, const char *detail)
 {

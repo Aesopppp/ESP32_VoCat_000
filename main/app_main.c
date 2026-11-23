@@ -216,6 +216,27 @@ static void handle_voice_auth_failure(const char *reason)
     /* 若 HTTP 已因 401/403 等停止，下一次 prepare 会返回 BLOCKED，不能强行 refresh 解锁。 */
 }
 
+static void handle_network_changed(void)
+{
+    ws_service_invalidate_prepared();
+    device_handshake_service_renew_credentials();
+    if (wifi_service_get_state() != WIFI_STATE_GOT_IP)
+        (void)ws_service_disconnect();
+}
+
+static void prepare_standby_websocket(void)
+{
+    if (wifi_service_get_state() != WIFI_STATE_GOT_IP || provisioning_service_is_active() ||
+        session_requested) return;
+    const device_handshake_response_t *configuration = NULL;
+    if (device_handshake_service_prepare_websocket(&configuration) != DEVICE_WS_READY) return;
+    if (!configuration) return;
+    esp_err_t err = ws_service_prepare_connection(configuration->websocket.url,
+                                                  configuration->websocket.token);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "Standby WebSocket preparation failed: %s", esp_err_to_name(err));
+}
+
 static void retry_voice_connection(int64_t now)
 {
     if (!session_requested || cleanup_pending || !retry_at_ms || now < retry_at_ms ||
@@ -563,6 +584,8 @@ static void main_task(void *arg)
             case EV_WIFI_GOT_IP:
                 if (provisioning_service_is_active() || wifi_service_get_state() != WIFI_STATE_GOT_IP) break;
                 provisioning_service_confirm();
+                handle_network_changed();
+                prepare_standby_websocket();
                 /* 普通联网不打开 WS；重复 IP 事件不能打断正在进行的对话。 */
                 if (!session_requested) {
                     ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word before connecting");
@@ -584,6 +607,7 @@ static void main_task(void *arg)
                 if (provisioning_service_is_active() || wifi_service_get_state() == WIFI_STATE_GOT_IP ||
                     wifi_service_get_state() == WIFI_STATE_IDLE) break;
                 if (event.type == EV_WIFI_CONNECT_FAILED && wifi_service_get_state() != WIFI_STATE_FAIL) break;
+                handle_network_changed();
                 if (event.type == EV_WIFI_CONNECT_FAILED) {
                     provisioning_service_rollback();
                     enter_provisioning("Wi-Fi connection failed");
@@ -672,6 +696,7 @@ static void main_task(void *arg)
         if (cleanup_pending && now >= cleanup_at_ms) stop_session_audio();
         device_handshake_service_poll(wifi_service_get_state() == WIFI_STATE_GOT_IP &&
                                       !provisioning_service_is_active());
+        prepare_standby_websocket();
         device_mqtt_service_set_dispatch_allowed(
             wifi_service_get_state() == WIFI_STATE_GOT_IP &&
             !provisioning_service_is_active() && !cleanup_pending && !reminder_task &&

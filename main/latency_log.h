@@ -14,6 +14,7 @@ extern "C" {
 
 void latency_log_begin(uint32_t monotonic_ms, uint32_t boot_seed);
 void latency_log_event(const char *event, uint32_t monotonic_ms);
+void latency_log_standby_event(const char *event, uint32_t monotonic_ms);
 void latency_log_event_detail(const char *event, uint32_t monotonic_ms,
                               const char *room, const char *detail);
 void latency_log_room(const char *room);

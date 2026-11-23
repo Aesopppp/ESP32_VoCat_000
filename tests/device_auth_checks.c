@@ -16,6 +16,7 @@
 #define CFG_KEY_WS_URL 1
 #define CFG_KEY_ACOS_TOKEN 2
 #define WIFI_STATE_GOT_IP 1
+#define WIFI_STATE_IDLE 0
 #define ACOS_WS_URL "wss://legacy.example/realtime"
 #define DEVICE_HANDSHAKE_WS_REFRESH_MARGIN_SECONDS 300u
 #define atomic_load(p) (*(p))
@@ -79,9 +80,12 @@ static int settimeofday(const struct timeval *tv, const void *timezone)
 static esp_websocket_client_handle_t client;
 static ws_conn_state_t state;
 static bool client_started, credentials_from_handshake, fail_alloc, fail_client, fail_send, fail_stop;
+static char prepared_url[PROTO_WS_URL_MAX + 1], prepared_token[PROTO_AUTH_TOKEN_MAX + 1];
+static char client_url[PROTO_WS_URL_MAX + 1];
 static proto_ws_credentials_t *credentials;
 static unsigned creates, stops, connects, recoveries, ends;
 static char sent[PROTO_REMINDER_AUTH_FRAME_SIZE], source_name[80], configured_url[PROTO_WS_URL_MAX + 1];
+static char legacy_url[PROTO_WS_URL_MAX + 1] = ACOS_WS_URL;
 static size_t reminder_task_count;
 static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
 static void *heap_caps_calloc(size_t count, size_t size, int caps)
@@ -89,7 +93,7 @@ static void *heap_caps_calloc(size_t count, size_t size, int caps)
 static void *heap_caps_malloc(size_t size, int caps)
 { (void)caps; return fail_alloc ? NULL : malloc(size); }
 static void cfg_service_get_str(int key, char *out, size_t size, const char *fallback)
-{ (void)fallback; snprintf(out, size, "%s", key == CFG_KEY_WS_URL ? ACOS_WS_URL : "legacy-test-only"); }
+{ (void)fallback; snprintf(out, size, "%s", key == CFG_KEY_WS_URL ? legacy_url : "legacy-test-only"); }
 static esp_websocket_client_handle_t create_client(const char *url)
 {
     ++creates; snprintf(configured_url, sizeof(configured_url), "%s", url);
@@ -109,6 +113,7 @@ int esp_websocket_client_send_text(esp_websocket_client_handle_t handle, const c
 
 static bool session_requested, voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
 static bool cleanup_pending;
+static bool network_disconnected;
 static device_mqtt_delivery_t *reminder_task;
 esp_err_t ws_service_prepare_reminder(const char *device_id, const char *const *ids, size_t count)
 {
@@ -121,14 +126,45 @@ static int64_t retry_at_ms, auth_deadline_ms;
 static bool network_ready, provisioning;
 static int wifi_service_get_state(void) { return network_ready ? WIFI_STATE_GOT_IP : 0; }
 static bool provisioning_service_is_active(void) { return provisioning; }
+typedef struct host_addrinfo {
+    int ai_flags, ai_family, ai_socktype, ai_protocol, ai_addrlen, ai_canonname, ai_addr, ai_next;
+} host_addrinfo_t;
+#define addrinfo host_addrinfo_t
+static int fake_getaddrinfo(const char *node, const char *service, const void *hints,
+                            host_addrinfo_t **res);
+static void fake_freeaddrinfo(host_addrinfo_t *res);
+#define latency_log_standby_event(...) ((void)0)
+#define getaddrinfo fake_getaddrinfo
+#define freeaddrinfo fake_freeaddrinfo
+#include "ws_prepared.c.inc"
+static unsigned dns_lookups, dns_frees;
+static int fake_getaddrinfo(const char *node, const char *service, const void *hints,
+                            host_addrinfo_t **res)
+{
+    (void)service; (void)hints;
+    ++dns_lookups;
+    CHECK(node != NULL && strstr(node, "example") != NULL);
+    *res = calloc(1, sizeof(**res)); CHECK(*res != NULL);
+    return 0;
+}
+static void fake_freeaddrinfo(host_addrinfo_t *res)
+{
+    CHECK(res != NULL); ++dns_frees; free(res);
+}
 esp_err_t ws_service_disconnect(void)
 {
     ++stops;
     if (fail_stop) return ESP_FAIL;
+    if (network_disconnected) return ESP_FAIL;
     client_started = false; state = WS_STATE_DISCONNECTED; return ESP_OK;
 }
 esp_err_t ws_service_connect(void)
-{ ++connects; CHECK(credentials && credentials->token[0]); client_started = true; return ESP_OK; }
+{
+    ++connects;
+    CHECK(client_started || credentials || prepared_token[0]);
+    client_started = true;
+    return ESP_OK;
+}
 static void end_conversation(const char *reason)
 { CHECK(reason != NULL); ++ends; session_requested = false; }
 static void recover_session(const char *reason)
@@ -161,13 +197,18 @@ static void fresh(void)
     strcpy(s_snapshot->result.response.websocket.token, "device-test-only");
     s_snapshot->result.response.websocket.expires_in = 3600;
     client = (esp_websocket_client_handle_t)(uintptr_t)1; state = WS_STATE_DISCONNECTED;
+    configured_url[0] = 0;
     client_started = credentials_from_handshake = fail_alloc = fail_client = fail_send = fail_stop = false;
+    prepared_url[0] = prepared_token[0] = 0;
+    client_url[0] = 0;
     creates = stops = connects = recoveries = ends = 0;
-    sent[0] = source_name[0] = configured_url[0] = 0;
+    sent[0] = source_name[0] = 0;
     session_requested = network_ready = true; provisioning = false;
+    network_disconnected = false;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
     reminder_task=NULL; reminder_task_count=0; reminder_device_id[0]=0;
     retry_at_ms = test_now; auth_deadline_ms = 0;
+    dns_lookups = dns_frees = 0;
 }
 
 static handshake_attempt_t *finish_http(int status, bool success)
@@ -389,9 +430,55 @@ static void credential_boundary_checks(void)
     CHECK(strcmp(credentials->url, "wss://new.example") == 0 && strcmp(credentials->token, "new-token") == 0);
 }
 
+static void prepared_connection_checks(void)
+{
+    fresh();
+    unsigned baseline_creates = creates, baseline_dns = dns_lookups;
+    snprintf(legacy_url, sizeof(legacy_url), "%s",
+             s_snapshot->result.response.websocket.url);
+    snprintf(configured_url, sizeof(configured_url), "%s",
+             s_snapshot->result.response.websocket.url);
+    CHECK(ws_service_prepare_connection(s_snapshot->result.response.websocket.url,
+                                        s_snapshot->result.response.websocket.token) == ESP_OK);
+    CHECK(creates == baseline_creates && connects == 0 && !client_started);
+    CHECK(dns_lookups > baseline_dns && dns_frees == dns_lookups);
+    CHECK(ws_service_prepare_connection(s_snapshot->result.response.websocket.url,
+                                        s_snapshot->result.response.websocket.token) == ESP_OK);
+    CHECK(creates == baseline_creates && connects == 0);
+    retry_voice_connection(test_now);
+    CHECK(connects == 1);
+    CHECK(strcmp(configured_url, s_snapshot->result.response.websocket.url) == 0);
+    CHECK(strcmp(credentials->token, s_snapshot->result.response.websocket.token) == 0);
+
+    fresh();
+    CHECK(ws_service_prepare_connection("wss://prepared.example/realtime", "prepared-token") == ESP_OK);
+    unsigned warmed = dns_lookups;
+    ws_service_invalidate_prepared();
+    CHECK(dns_lookups == warmed);
+    CHECK(ws_service_prepare_connection("wss://renewed.example/realtime", "renewed-token") == ESP_OK);
+    CHECK(creates >= 1 && dns_lookups >= warmed && connects == 0);
+    retry_voice_connection(test_now);
+    CHECK(connects == 1);
+
+    fresh(); network_ready = false; network_disconnected = true;
+    handle_network_changed();
+    CHECK(ws_service_prepare_connection("wss://stale.example/realtime", "stale-token") == ESP_ERR_INVALID_STATE);
+    CHECK(creates == 0 && connects == 0 && stops == 1);
+
+    fresh();
+    session_requested = false;
+    prepare_standby_websocket();
+    CHECK(creates == 0 && connects == 0 && dns_lookups == 1);
+    CHECK(strcmp(prepared_url, s_snapshot->result.response.websocket.url) == 0);
+    session_requested = true;
+    retry_voice_connection(test_now);
+    CHECK(connects == 1);
+}
+
 int main(void)
 {
     handshake_poll_checks(); builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
+    prepared_connection_checks();
     release_credentials(credentials); clear_snapshot();
     printf("PASS: %u device voice authentication checks (production code; mocked transport)\n", checks);
     return 0;

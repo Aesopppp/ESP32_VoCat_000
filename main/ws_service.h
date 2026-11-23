@@ -42,6 +42,11 @@ typedef enum {
 
 /* ---- Public API -------------------------------------------------------- */
 esp_err_t ws_service_init(void);
+/* WiFi 就绪或凭据轮换后在待机阶段调用：只准备客户端对象并预热 DNS，不调用 connect。
+ * 唤醒时传入相同 URL/token 可直接复用准备结果；参数不为 NULL 且必须是完整副本。 */
+esp_err_t ws_service_prepare_connection(const char *url, const char *token);
+/* WiFi 断开、配网或凭据失效时清除预加载缓存；不关闭已经建立的会话。 */
+void ws_service_invalidate_prepared(void);
 /* 主任务先 disconnect，再设置本次连接的 URL/token，最后 connect。
  * 非 NULL 输入被整组复制，最长长度见 proto_service.h；不借用 HTTP 快照。
  * 两参数均 NULL 才读取旧 NVS 配置，调用者仅在握手显式关闭时允许这样做。
