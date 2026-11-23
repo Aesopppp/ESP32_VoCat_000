@@ -260,7 +260,7 @@ static void handle_frame(const rx_frame_t *packet)
                 if (++played_frames == 1)
                     ESP_LOGI(TAG, "Continuous audio accepted; microphone upload remains active");
                 if (played_frames == 1)
-                    latency_log_event("agent-first-audio", packet.received_ms);
+                    latency_log_event("agent-first-audio", packet->received_ms);
             }
         }
         xSemaphoreGive(playback_lock);
@@ -280,7 +280,7 @@ static void handle_frame(const rx_frame_t *packet)
     }
     if (msg.evt == PROTO_EVT_PROXY_CONNECTED && state == WS_STATE_AUTHING) {
         state = WS_STATE_CONNECTED;
-        latency_log_event("proxy-connected", packet.received_ms);
+        latency_log_event("proxy-connected", packet->received_ms);
         publish(EV_WS_AUTH_OK, packet->generation);
     } else if (msg.evt == PROTO_EVT_ERROR) {
         log_server_error(&msg);

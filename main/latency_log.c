@@ -6,6 +6,7 @@
 
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_random.h"
 
 static char s_session_id[LAT_SESSION_ID_MAX] = "wake-pending";
 static char s_room[LAT_ROOM_ID_MAX];
