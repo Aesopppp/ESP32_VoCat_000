@@ -22,6 +22,7 @@
 #include "esp_afe_sr_models.h"
 #include "audio_out.h"
 #include "app_state.h"
+#include "latency_log.h"
 #include "model_path.h"
 #include "string.h"
 #include "esp_heap_caps.h"
@@ -74,8 +75,10 @@ static SemaphoreHandle_t s_audio_buffer_lock;
 static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；会话内一直允许连续上传。 */
 static bool s_pre_roll_enabled = false; /* 与 FIFO 一起由 s_audio_buffer_lock 保护。 */
 static bool s_pre_roll_uploading;
+static bool s_pre_roll_replay_sealed;
 static bool s_first_phrase_speech_seen, s_first_phrase_closed, s_live_buffer_active;
 static uint32_t s_first_phrase_silence_samples, s_first_phrase_end, s_live_read_end;
+static uint32_t s_pre_roll_replay_end;
 static uint32_t s_wake_boundary_sample = 0;
 static uint32_t s_afe_sample_end; /* 每个有效 fetch 帧推进，包括待机；不随 FIFO 清空复位。 */
 static uint32_t s_pre_roll_dropped_frames;
@@ -120,8 +123,10 @@ static void clear_audio_buffer_locked(void)
     memset(&s_audio_progress, 0, sizeof(s_audio_progress));
     s_overflow_frames = 0;
     s_pre_roll_enabled = s_pre_roll_uploading = false;
+    s_pre_roll_replay_sealed = false;
     s_first_phrase_speech_seen = s_first_phrase_closed = s_live_buffer_active = false;
     s_first_phrase_silence_samples = s_first_phrase_end = s_live_read_end = 0;
+    s_pre_roll_replay_end = 0;
     s_wake_boundary_sample = s_pre_roll_dropped_frames = 0;
 }
 
@@ -175,17 +180,25 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
     if (!s_ringbuf || !pcm || !sample_end) return 0;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     bool switched = false;
-    uint32_t skipped_samples = 0, live_samples = 0;
-    if (s_first_phrase_closed && !s_live_buffer_active &&
+    uint32_t replay_end_ms = 0;
+    uint32_t replay_samples = 0;
+    uint32_t live_samples = 0;
+    uint32_t skipped_samples = 0;
+    if (s_pre_roll_replay_sealed && !s_live_buffer_active &&
         audio_buffer_frames_locked(s_ringbuf) == 0) {
         /* 上一帧已交给同一个编码任务，半个 Opus 帧和 TX 队列仍保持顺序。
          * 只跳过 live FIFO 已淘汰的旧帧，不丢首句，不等待 TX/平台确认。 */
-        skipped_samples = s_live_read_end - s_audio_progress.read_end;
-        s_audio_progress.read_end = s_live_read_end;
+        uint32_t replay_end = s_pre_roll_replay_end;
+        uint32_t live_start = s_live_read_end;
+        replay_samples = replay_end > s_audio_progress.read_end ?
+                         replay_end - s_audio_progress.read_end : 0;
+        s_audio_progress.read_end = live_start;
+        skipped_samples = live_start > replay_end ? live_start - replay_end : 0;
         live_samples = s_audio_progress.written_end - s_live_read_end;
         s_live_buffer_active = true;
         s_pre_roll_enabled = s_pre_roll_uploading = false;
         switched = true;
+        replay_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
     }
     RingbufHandle_t ringbuf = s_live_buffer_active ? s_live_ringbuf : s_ringbuf;
     size_t bytes = 0;
@@ -199,8 +212,13 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
         vRingbufferReturnItem(ringbuf, item);
     }
     xSemaphoreGive(s_audio_buffer_lock);
+    if (switched) {
+        latency_log_event("pre-roll-replay-ended", replay_end_ms);
+        latency_log_event("live-fifo-source-selected", replay_end_ms);
+    }
     if (switched)
-        ESP_LOGI(TAG, "First phrase queued; switched to live audio (skipped_ms=%lu live_ms=%lu)",
+        ESP_LOGI(TAG, "Pre-roll replay ended; switched to live audio (replayed_ms=%lu skipped_ms=%lu live_ms=%lu)",
+                 (unsigned long)(replay_samples / (BSP_I2S_SAMPLE_RATE / 1000u)),
                  (unsigned long)(skipped_samples / (BSP_I2S_SAMPLE_RATE / 1000u)),
                  (unsigned long)(live_samples / (BSP_I2S_SAMPLE_RATE / 1000u)));
     return bytes;
@@ -216,7 +234,8 @@ void wake_word_confirm_audio_sent(uint32_t sample_end)
      * 不让迟到的发送确认打乱两个 FIFO 的边界。生命周期切换仍须先
      * 停止两个上传任务再清 FIFO，禁止旧连接确认影响新连接。 */
     pending_samples = s_audio_progress.written_end - sample_end;
-    if (s_pre_roll_enabled && s_pre_roll_uploading && !s_first_phrase_closed &&
+    if (s_pre_roll_enabled && s_pre_roll_uploading && !s_pre_roll_replay_sealed &&
+        !s_first_phrase_closed &&
         pending_samples <= BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) {
         s_pre_roll_enabled = s_pre_roll_uploading = false;
         dropped = s_pre_roll_dropped_frames;
@@ -263,10 +282,20 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
     }
     size_t dropped = 0;
     bool stored = false;
-    bool live_tail = s_first_phrase_closed;
+    bool live_tail = s_first_phrase_closed || s_pre_roll_replay_sealed;
     RingbufHandle_t ringbuf = live_tail ? s_live_ringbuf : s_ringbuf;
     uint32_t *read_end = live_tail ? &s_live_read_end : &s_audio_progress.read_end;
-    if (s_pre_roll_enabled && !s_first_phrase_closed) {
+    if (live_tail) {
+        const size_t max_frames = (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
+        while (audio_buffer_frames_locked(ringbuf) >= max_frames &&
+               discard_oldest_audio_locked(ringbuf, read_end))
+            ++dropped;
+        while (!(stored = xRingbufferSend(ringbuf, res->data, frame_bytes, 0) == pdTRUE)) {
+            if (!discard_oldest_audio_locked(ringbuf, read_end)) break;
+            ++dropped;
+        }
+        if (s_live_buffer_active) s_audio_progress.read_end = s_live_read_end;
+    } else if (s_pre_roll_enabled) {
         if (audio_buffer_frames_locked(s_ringbuf) < WAKE_WORD_RB_ITEM_COUNT)
             stored = xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) == pdTRUE;
         if (!stored) {
@@ -752,16 +781,26 @@ bool wake_word_prepare_pre_roll_upload(void)
         return false;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     bool prepared = s_pre_roll_enabled;
-    if (prepared) {
+    if (prepared && !s_pre_roll_replay_sealed) {
         s_pre_roll_uploading = true;
+        uint32_t cap_samples = BSP_I2S_SAMPLE_RATE / 1000u * WAKE_WORD_REPLAY_CAP_MS;
+        uint32_t discarded = 0;
+        uint32_t retain_end = s_first_phrase_closed ? s_first_phrase_end : s_audio_progress.written_end;
+        while (retain_end - s_audio_progress.read_end > cap_samples &&
+               discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end))
+            ++discarded;
+        s_pre_roll_replay_end = retain_end;
+        s_pre_roll_replay_sealed = true;
+        if (discarded) s_pre_roll_dropped_frames = discarded;
         ESP_LOGI(TAG, "Pre-roll upload ready: boundary_sample=%lu buffered_ms=%lu dropped_new=%lu",
                  (unsigned long)s_wake_boundary_sample,
                  (unsigned long)((s_audio_progress.written_end - s_audio_progress.read_end) /
                                  (BSP_I2S_SAMPLE_RATE / 1000u)),
                  (unsigned long)s_pre_roll_dropped_frames);
     }
+    bool active = s_pre_roll_uploading;
     xSemaphoreGive(s_audio_buffer_lock);
-    return prepared;
+    return active;
 }
 
 esp_err_t wake_word_start(void)

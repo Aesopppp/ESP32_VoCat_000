@@ -267,8 +267,11 @@ static void start_audio_session(const char *reason)
         recover_session("could not select listening AFE");
         return;
     }
-    /* 唤醒检测任务已记录边界；补传由 FIFO 模块保护，不能在鉴权时丢掉首句。 */
-    if (!wake_word_prepare_pre_roll_upload()) {
+    /* 鉴权时封存唤醒前摇：只补最近 800ms，后续实时音频直接进入 live FIFO。 */
+    bool pre_roll_ready = wake_word_prepare_pre_roll_upload();
+    if (pre_roll_ready) {
+        latency_log_event("pre-roll-replay-ready", (uint32_t)now_ms());
+    } else {
         wake_word_clear_audio_buffer();
     }
     if (app_state_start_listening() != ESP_OK) {

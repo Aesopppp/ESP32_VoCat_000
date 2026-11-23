@@ -47,6 +47,7 @@ extern "C" {
  * AFE 自身已经做静音持续时间判定；这里只额外容忍短暂无声帧。
  * 此值不是原始麦克风的总句尾等待时间，也不参与平台打断。 */
 #define WAKE_WORD_FIRST_PHRASE_SILENCE_MS 160u
+#define WAKE_WORD_REPLAY_CAP_MS 800u
 #define WAKE_WORD_LIVE_RB_ITEM_COUNT 16u  /* 16 × 32 ms = 512 ms */
 
 /** PSRAM FIFO backing store including per-item headers. Wake-to-connect replay

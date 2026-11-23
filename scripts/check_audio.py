@@ -79,8 +79,8 @@ def main():
     for name, sources in cases.items():
         executable = output / (name + ".exe")
         with (output / (name + ".log")).open("w", encoding="utf-8") as log:
-            for command in ([args.cc, "-std=c11", "-Wall", "-Werror", "-o", str(executable), *sources],
-                            [str(executable)]):
+            compile_command = [args.cc, "-std=c11", "-Wall", "-Werror", "-o", str(executable), *sources]
+            for command in (compile_command, [str(executable)]):
                 result = subprocess.run(command, cwd=root, text=True, encoding="utf-8",
                                         errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 log.write(result.stdout)

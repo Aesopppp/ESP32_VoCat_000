@@ -6,10 +6,10 @@
 #include "../../main/audio_in.c"
 
 static bool latency_uplink_pending;
-static void latency_log_event(const char *event, uint32_t ms)
+void latency_log_event(const char *event, uint32_t ms)
 { (void)event; (void)ms; }
-static void latency_log_mark_upload_phase(void) { latency_uplink_pending = true; }
-static bool latency_log_first_live_uplink_pending(void)
+void latency_log_mark_upload_phase(void) { latency_uplink_pending = true; }
+bool latency_log_first_live_uplink_pending(void)
 { bool pending = latency_uplink_pending; latency_uplink_pending = false; return pending; }
 
 #define CHECK(expr) do { ++checks; if (!(expr)) { \
