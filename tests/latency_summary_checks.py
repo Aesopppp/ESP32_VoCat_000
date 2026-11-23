@@ -114,6 +114,30 @@ class LatencySummaryChecks(unittest.TestCase):
         self.assertTrue(summary["warnings"])
         self.assertTrue(any("monotonic wrap" in warning for warning in summary["warnings"]))
 
+    def test_reports_zero_when_agent_audio_precedes_speech_stopped(self):
+        events = timeline([
+            ("wake-requested", 15150),
+            ("ws-before-tcp-connect", 15244),
+            ("ws-transport-connected", 18318),
+            ("ws-tls-and-handshake-done", 18320),
+            ("proxy-connected", 18442),
+            ("audio-upload-ready", 18444),
+            ("first-live-uplink", 18465),
+            ("agent-first-audio", 19033),
+            ("speech-stopped", 21147),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "device.log"
+            path.write_text(events, encoding="utf-8")
+            summary = summarize(load_latency_log(path))
+        self.assertEqual(
+            summary["durations_ms"]["speech_stopped_to_agent_first_audio"], 0
+        )
+        self.assertTrue(any(
+            "agent-first-audio preceded speech-stopped" in warning
+            for warning in summary["warnings"]
+        ))
+
     def test_summary_is_json_serializable(self):
         events = timeline([
             ("wake-requested", 100),

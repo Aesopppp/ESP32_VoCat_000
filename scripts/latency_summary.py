@@ -66,7 +66,7 @@ def _duration(timeline, start, end):
     if end not in timeline:
         raise ValueError(f"missing required latency event: {end}")
     if timeline[end] < timeline[start]:
-        return timeline[end] + UINT32_WRAP - timeline[start]
+        return None
     return timeline[end] - timeline[start]
 
 
@@ -97,6 +97,14 @@ def summarize(events):
     if missing:
         raise ValueError(f"missing required latency events: {', '.join(missing)}")
     wake = timeline["wake-requested"]
+    speech_stopped_to_audio = _duration(
+        timeline, "speech-stopped", "agent-first-audio"
+    )
+    if speech_stopped_to_audio is None:
+        speech_stopped_to_audio = 0
+        warnings.append(
+            "agent-first-audio preceded speech-stopped; reporting 0 ms for that segment"
+        )
     result = {
         "session_id": events[0].session,
         "room": room,
@@ -110,9 +118,7 @@ def summarize(events):
             "auth_to_first_live_uplink": _duration(
                 timeline, "audio-upload-ready", "first-live-uplink"
             ),
-            "speech_stopped_to_agent_first_audio": _duration(
-                timeline, "speech-stopped", "agent-first-audio"
-            ),
+            "speech_stopped_to_agent_first_audio": speech_stopped_to_audio,
         },
         "overall_ms": _duration(timeline, "wake-requested", "agent-first-audio"),
         "warnings": warnings,
