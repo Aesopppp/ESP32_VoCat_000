@@ -118,12 +118,15 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
 esp_err_t audio_in_stop(audio_in_handle_t h);
 
 /** 暂停上传的通用接口：保留当前 PCM、半包 Opus 和编码器；平台打断不调用此接口。
- * 仅主任务调用，最多等 2 秒；start_from_ringbuf 恢复同一任务，stop 仍完整退出。 */
+ * 仅主任务调用，最多等 2 秒并等待编码/TX 双侧确认；恢复保留半包和排队包。
+ * start_from_ringbuf 恢复两个任务；stop 等两侧退出后才释放资源。 */
 esp_err_t audio_in_pause(audio_in_handle_t h);
 typedef struct {
     bool running;
     uint32_t sent_end;
     uint32_t speech_end;
+    uint32_t tx_queue_ms; /* 固定队列含正在发送包，0..80 ms */
+    uint32_t pending_ms;  /* written_end - 实际发送 sent_end，含 FIFO/半包/队列 */
 } audio_in_upload_status_t;
 /** 线程安全的上传进度快照，采样单位为 16 kHz PCM；不读取编码器内部状态。 */
 void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *status);

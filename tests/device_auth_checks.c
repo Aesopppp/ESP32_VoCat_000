@@ -21,6 +21,7 @@
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) (*(p) = (v))
 #define pdMS_TO_TICKS(ms) (ms)
+#define pdTRUE 1
 
 static unsigned checks;
 #define CHECK(expr) do { ++checks; if (!(expr)) { \
@@ -31,17 +32,47 @@ static int64_t now_ms(void) { return test_now; }
 int64_t esp_timer_get_time(void) { return test_now * 1000; }
 uint32_t esp_random(void) { return 1234; }
 
-static bool s_initialized, s_disabled;
+static bool s_initialized, s_disabled, s_pending;
 static device_handshake_config_t config;
 static device_handshake_config_t *s_config;
 static device_handshake_schedule_t s_schedule;
-static unsigned s_seen_epoch, s_network_epoch, s_cancel_generation;
-typedef struct { int64_t acquired_ms; device_handshake_result_t result; } test_snapshot_t;
-static test_snapshot_t *s_snapshot;
-static void clear_snapshot(void)
+static unsigned s_seen_epoch, s_network_epoch, s_cancel_generation, s_mqtt_epoch;
+typedef struct {
+    unsigned network_epoch;
+    uint32_t generation;
+    int64_t acquired_ms;
+    device_handshake_config_t config;
+    device_handshake_result_t result;
+} handshake_attempt_t;
+static handshake_attempt_t *s_snapshot;
+/* 队列只传递所有权；测试显式投递 worker 结果，不执行 HTTP 或启动线程。 */
+typedef struct { handshake_attempt_t *item; } test_queue_t;
+static test_queue_t jobs_queue, results_queue, *s_jobs, *s_results;
+static unsigned http_requests, clock_updates;
+static int64_t applied_server_time_ms;
+static bool ensure_worker(void)
 {
-    if (s_snapshot) { memset(s_snapshot, 0, sizeof(*s_snapshot)); free(s_snapshot); }
-    s_snapshot = NULL;
+    s_jobs = &jobs_queue; s_results = &results_queue; return true;
+}
+static int xQueueSend(test_queue_t *queue, handshake_attempt_t **item, unsigned wait)
+{
+    CHECK(queue == s_jobs && wait == 0);
+    if (queue->item) return 0;
+    queue->item = *item; ++http_requests; return pdTRUE;
+}
+static int xQueueReceive(test_queue_t *queue, handshake_attempt_t **item, unsigned wait)
+{
+    CHECK(queue == s_results && wait == 0);
+    if (!queue->item) return 0;
+    *item = queue->item; queue->item = NULL; return pdTRUE;
+}
+/* 只记录生产代码的校时请求，绝不修改宿主机时钟。 */
+struct timeval { long tv_sec, tv_usec; };
+static int settimeofday(const struct timeval *tv, const void *timezone)
+{
+    CHECK(timezone == NULL);
+    applied_server_time_ms = (int64_t)tv->tv_sec * 1000 + tv->tv_usec / 1000;
+    ++clock_updates; return 0;
 }
 #include "device_handshake_service.c.inc"
 
@@ -112,12 +143,19 @@ static void fresh(void)
 {
     release_credentials(credentials); credentials = NULL;
     clear_snapshot();
+    release_attempt(jobs_queue.item); release_attempt(results_queue.item);
+    jobs_queue.item = results_queue.item = NULL;
+    s_jobs = s_results = NULL; s_pending = false;
+    http_requests = clock_updates = s_mqtt_epoch = 0; applied_server_time_ms = 0;
     memset(&config, 0, sizeof(config)); config.enabled = true; s_config = &config;
     s_schedule = (device_handshake_schedule_t){ .online = true, .ready = true, .generation = 1 };
     s_initialized = true; s_disabled = false;
     s_seen_epoch = s_network_epoch = s_cancel_generation = 1;
     test_now = 1000;
     s_snapshot = calloc(1, sizeof(*s_snapshot)); CHECK(s_snapshot != NULL);
+    s_snapshot->generation = s_schedule.generation;
+    s_snapshot->network_epoch = s_network_epoch;
+    s_snapshot->result.success = true; s_snapshot->result.status = 200;
     s_snapshot->acquired_ms = 1000;
     strcpy(s_snapshot->result.response.websocket.url, "wss://gateway.example:8443/v1/realtime");
     strcpy(s_snapshot->result.response.websocket.token, "device-test-only");
@@ -130,6 +168,77 @@ static void fresh(void)
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
     reminder_task=NULL; reminder_task_count=0; reminder_device_id[0]=0;
     retry_at_ms = test_now; auth_deadline_ms = 0;
+}
+
+static handshake_attempt_t *finish_http(int status, bool success)
+{
+    CHECK(jobs_queue.item && !results_queue.item && s_pending);
+    handshake_attempt_t *attempt = jobs_queue.item;
+    jobs_queue.item = NULL; results_queue.item = attempt;
+    attempt->result.status = status; attempt->result.success = success;
+    attempt->result.reason = "test result";
+    attempt->result.response.server_time_ms = 1700000000123LL;
+    attempt->result.response.websocket.expires_in = 3600;
+    strcpy(attempt->result.response.websocket.url, "wss://gateway.example/v1/realtime");
+    strcpy(attempt->result.response.websocket.token, "new-test-only-token");
+    return attempt;
+}
+
+static void handshake_poll_checks(void)
+{
+    fresh();
+    handshake_attempt_t *cached = s_snapshot;
+    const device_handshake_response_t *response = NULL;
+    ++s_network_epoch;
+    CHECK(!device_handshake_service_get_configuration()); /* 回调后、poll 前也不可用。 */
+    device_handshake_service_poll(false);
+    CHECK(s_snapshot == cached && !s_schedule.ready && !s_schedule.online && !http_requests);
+    CHECK(s_cancel_generation == s_schedule.generation && s_mqtt_epoch == 1);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
+    ++s_network_epoch;
+    device_handshake_service_poll(true);
+    /* D3 只保留快照；恢复联网仍需一次 HTTP，不能宣称旧 token 已复用。 */
+    CHECK(s_snapshot == cached && !s_schedule.ready && s_pending && http_requests == 1);
+    CHECK(s_mqtt_epoch == 2 && jobs_queue.item->generation == s_schedule.generation);
+    CHECK(jobs_queue.item->network_epoch == s_network_epoch);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
+    for (unsigned i = 0; i < 3; ++i) device_handshake_service_poll(true);
+    CHECK(http_requests == 1);
+    handshake_attempt_t *finished = finish_http(200, true);
+    device_handshake_service_poll(true);
+    CHECK(s_snapshot == finished && s_schedule.ready && !s_pending && http_requests == 1);
+    CHECK(clock_updates == 1 && applied_server_time_ms == 1700000000123LL);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY);
+    CHECK(response && strcmp(response->websocket.token, "new-test-only-token") == 0);
+    CHECK(device_handshake_service_renew_credentials() && !s_snapshot && !s_schedule.ready);
+    device_handshake_service_poll(true);
+    CHECK(http_requests == 2 && s_pending); /* 显式续期仍触发新请求。 */
+
+    for (unsigned stale = 0; stale < 2; ++stale) {
+        fresh(); cached = s_snapshot;
+        ++s_network_epoch; device_handshake_service_poll(true);
+        finished = finish_http(200, true);
+        /* 分别验证两道门禁，避免其中一项正确掩盖另一项失效。 */
+        if (stale == 0) --finished->network_epoch;
+        else --finished->generation;
+        device_handshake_service_poll(true);
+        CHECK(s_snapshot == cached && !s_schedule.ready && !s_schedule.blocked && !clock_updates);
+        CHECK(strcmp(cached->result.response.websocket.token, "device-test-only") == 0);
+        CHECK(!device_handshake_service_get_configuration() && http_requests == 2 && s_pending);
+    }
+
+    const int permanent[] = {401, 403, 404};
+    for (unsigned i = 0; i < sizeof(permanent) / sizeof(permanent[0]); ++i) {
+        fresh(); ++s_network_epoch; device_handshake_service_poll(true);
+        finish_http(permanent[i], false); device_handshake_service_poll(true);
+        CHECK(!s_snapshot && s_schedule.blocked && !s_pending && http_requests == 1);
+        CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_BLOCKED && !response);
+        CHECK(!device_handshake_service_renew_credentials());
+        ++s_network_epoch; device_handshake_service_poll(false);
+        ++s_network_epoch; device_handshake_service_poll(true);
+        CHECK(s_schedule.blocked && !s_snapshot && !device_handshake_service_get_configuration());
+        CHECK(http_requests == 1 && !clock_updates);
+    }
 }
 
 static void builder_checks(void)
@@ -282,7 +391,7 @@ static void credential_boundary_checks(void)
 
 int main(void)
 {
-    builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
+    handshake_poll_checks(); builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
     release_credentials(credentials); clear_snapshot();
     printf("PASS: %u device voice authentication checks (production code; mocked transport)\n", checks);
     return 0;

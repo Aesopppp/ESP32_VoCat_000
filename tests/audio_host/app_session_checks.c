@@ -13,8 +13,8 @@
 
 static unsigned checks, takes, stops, closes, clears, releases, starts, recoveries, wakes;
 static bool conversation_active, session_requested, cleanup_pending;
-static bool s_pre_roll_used;
-static uint32_t s_wake_boundary_sample;
+static bool pre_roll_active, mode_kept_pre_roll, wake_on_return_to_idle;
+static unsigned pre_roll_prepares, pre_roll_cancels;
 static int64_t cleanup_at_ms;
 static bool voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
 static bool provisioning, voice_enabled, dispatch_allowed, output_speaking, audio_active;
@@ -38,13 +38,15 @@ void ws_service_get_speech_status(ws_speech_status_t *status) { *status=platform
 esp_err_t wifi_service_set_audio_active(bool active) { audio_active=active; return ESP_OK; }
 app_state_t app_state_get(void) { return current_state; }
 app_state_t app_state_set(app_state_t s) { app_state_t old=current_state; current_state=s; return old; }
-esp_err_t wake_word_set_mode(wake_word_mode_t mode) { afe_mode=mode; return afe_result; }
+esp_err_t wake_word_set_mode(wake_word_mode_t mode)
+{ mode_kept_pre_roll=pre_roll_active; afe_mode=mode; return afe_result; }
 wake_word_mode_t wake_word_get_mode(void) { return afe_mode; }
 void wake_word_reset(void) {}
-void wake_word_clear_audio_buffer(void) { ++clears; input_voice_ms=0; }
-void wake_word_set_pre_roll(bool enabled) { (void)enabled; }
-void wake_word_mark_wake_boundary(void) { s_wake_boundary_sample=1; }
-void wake_word_discard_audio_before(uint32_t sample_end) { (void)sample_end; }
+void wake_word_clear_audio_buffer(void) { ++clears; input_voice_ms=0; pre_roll_active=false; }
+void wake_word_set_pre_roll(bool enabled)
+{ if(!enabled) { ++pre_roll_cancels; pre_roll_active=false; } }
+bool wake_word_prepare_pre_roll_upload(void)
+{ ++pre_roll_prepares; return pre_roll_active; }
 audio_in_handle_t audio_in_get_handle(void) { return (void*)1; }
 esp_err_t audio_in_stop(audio_in_handle_t h)
 { CHECK(h==(void*)1); ++stops; upload.running=audio_active=false; return ESP_OK; }
@@ -77,7 +79,10 @@ esp_err_t app_state_start_listening(void)
 }
 esp_err_t app_state_back_to_wait_wake(void)
 { if(idle_result!=ESP_OK) return idle_result;
-  current_state=APP_STATE_WAIT_WAKE; afe_mode=WAKE_WORD_MODE_WAKE; return ESP_OK; }
+  wake_word_clear_audio_buffer();
+  current_state=APP_STATE_WAIT_WAKE; afe_mode=WAKE_WORD_MODE_WAKE;
+  if(wake_on_return_to_idle) pre_roll_active=true; /* 模拟发布待机后立即检测到新唤醒。 */
+  return ESP_OK; }
 static void recover_session(const char *reason)
 { CHECK(reason!=NULL); ++recoveries; conversation_active=false; }
 #include "app_session.inc"
@@ -85,6 +90,8 @@ static void recover_session(const char *reason)
 static void reset(void)
 {
     conversation_active=session_requested=cleanup_pending=false;
+    pre_roll_active=mode_kept_pre_roll=wake_on_return_to_idle=false;
+    pre_roll_prepares=pre_roll_cancels=0;
     cleanup_at_ms=0;
     voice_auth_refresh_used=awaiting_voice_auth=waiting_for_credentials=false;
     provisioning=output_speaking=audio_active=false;
@@ -163,6 +170,48 @@ static void conversation_checks(void)
     reset(); conversation_active=session_requested=true; ws_state=WS_STATE_CONNECTED;
     upload.running=false; poll_conversation(); CHECK(recoveries==1);
 }
+static void wake_pre_roll_checks(void)
+{
+    /* 检测任务在发布 wake 事件前已保护 FIFO；主任务不得在切模式时取消。 */
+    reset(); pre_roll_active=true; start_conversation("wake word");
+    CHECK(session_requested && !conversation_active && mode_kept_pre_roll);
+    CHECK(pre_roll_active && pre_roll_cancels==0 && clears==0);
+    start_conversation("wake word");
+    CHECK(pre_roll_active && pre_roll_cancels==0 && clears==0);
+    clock_ms+=5000; ws_state=WS_STATE_CONNECTED; start_audio_session("wake auth");
+    CHECK(conversation_active && upload.running && pre_roll_prepares==1 && clears==0);
+    CHECK(pre_roll_active); /* 鉴权不能提前解除 FIFO 的补传保护。 */
+    start_audio_session("duplicate auth");
+    CHECK(pre_roll_prepares==1 && starts==1 && clears==0);
+    end_conversation("touch");
+    CHECK(!pre_roll_active && clears==1);
+    start_conversation("REC button");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("button auth");
+    CHECK(conversation_active && !pre_roll_active && clears==2);
+    /* 开关关闭/没有检测边界时回退旧清空路径，不能伪造边界。 */
+    reset(); start_conversation("wake word");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("auth without pre-roll");
+    CHECK(conversation_active && clears==1);
+    const char *sources[]={"touch", "REC button", "MQTT notification"};
+    for(unsigned i=0;i<sizeof(sources)/sizeof(sources[0]);++i) {
+        reset(); pre_roll_active=true; start_conversation(sources[i]);
+        CHECK(!pre_roll_active && !mode_kept_pre_roll && pre_roll_cancels==1);
+        ws_state=WS_STATE_CONNECTED; start_audio_session("non-wake auth");
+        CHECK(conversation_active && upload.running && clears==1);
+    }
+    reset(); pre_roll_active=true; provisioning=true; start_conversation("wake word");
+    CHECK(!session_requested && !pre_roll_active && pre_roll_cancels==1);
+    reset(); pre_roll_active=true; wifi_state=WIFI_STATE_DISCONNECTED;
+    start_conversation("wake word");
+    CHECK(!session_requested && !pre_roll_active && pre_roll_cancels==1);
+    reset(); pre_roll_active=true; start_conversation("wake word");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("auth");
+    wake_on_return_to_idle=true; end_conversation("touch then immediate wake");
+    CHECK(pre_roll_active && clears==1); /* 旧会话收尾不能抹掉新边界。 */
+    start_conversation("wake word"); ws_state=WS_STATE_CONNECTED;
+    start_audio_session("next auth");
+    CHECK(conversation_active && pre_roll_active && clears==1);
+}
 static void task_checks(void)
 {
     reset(); available=&batch; poll_reminder();
@@ -208,6 +257,6 @@ static void touch_checks(void)
 }
 int main(void)
 {
-    silence_checks(); conversation_checks(); task_checks(); touch_checks();
+    silence_checks(); conversation_checks(); wake_pre_roll_checks(); task_checks(); touch_checks();
     printf("PASS: %u unified app session checks\n",checks); return 0;
 }
