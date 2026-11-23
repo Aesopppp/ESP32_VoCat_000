@@ -7,7 +7,6 @@
 #include "board_config.h"
 #include "esp_crt_bundle.h"
 #include "tls_trust_anchor.h"
-#include "connect_latency_log.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
@@ -276,7 +275,6 @@ static void handle_frame(const rx_frame_t *packet)
         xSemaphoreGive(playback_lock); return;
     }
     if (msg.evt == PROTO_EVT_PROXY_CONNECTED && state == WS_STATE_AUTHING) {
-        LAT_LOG("ws-proxy-connected");
         state = WS_STATE_CONNECTED;
         publish(EV_WS_AUTH_OK, packet->generation);
     } else if (msg.evt == PROTO_EVT_ERROR) {
@@ -326,12 +324,10 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
     uint32_t gen = atomic_load(&generation);
     if (id == WEBSOCKET_EVENT_BEFORE_CONNECT) {
         /* 已创建网络任务/transport，尚未分配本轮 TLS 握手内存。 */
-        LAT_LOG("ws-before-tcp-connect");
         log_connection_memory("before-tls");
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
         state = WS_STATE_AUTHING;
         reset_speech_status();
-        LAT_LOG("ws-tls-and-handshake-done");
         log_connection_memory("connected");
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
@@ -395,7 +391,7 @@ static esp_websocket_client_handle_t create_client(const char *uri)
         .task_stack = 6144, /* 有界 JSON 解析和协议字段副本，避免默认栈过紧。 */
 #ifdef DEVICE_PLATFORM_TLS_CA
         .crt_bundle_attach = NULL,
-        .ca_cert = tls_trust_anchor_ca_pem(),
+        .cert_pem = tls_trust_anchor_ca_pem(),
 #else
         .crt_bundle_attach = esp_crt_bundle_attach,
 #endif
@@ -500,7 +496,6 @@ esp_err_t ws_service_connect(void)
 {
     if (!client || !credentials) return ESP_ERR_INVALID_STATE;
     if (client_started) return ESP_OK;
-    LAT_LOG("ws-service-connect-enter");
     state = WS_STATE_CONNECTING;
     reset_speech_status();
     esp_err_t err = esp_websocket_client_start(client);

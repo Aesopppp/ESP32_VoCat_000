@@ -80,8 +80,8 @@ else()
 endif()
 
 # 平台 HTTPS/WSS 入口的自定义信任根（ISRG Root X2）。
-# 用它代替 esp_crt_bundle_attach：省掉 ~140 张 CA 的解析和 3 次 ECDSA P-384
-# 验签，实测每次握手 2.7s→~0.3s。证书随代码发布（公开根，无私钥）。
+# 将平台 HTTPS/WSS 的信任范围限定为该 CA，仍验证完整证书链和主机名。
+# 实际握手耗时需在设备测量；使用单根不能跳过叶证书及中间证书验签。
 set(platform_tls_ca "${CMAKE_CURRENT_SOURCE_DIR}/certs/platform_tls_ca.pem")
 if(EXISTS "${platform_tls_ca}")
     target_add_binary_data(${COMPONENT_LIB} "${platform_tls_ca}" TEXT)

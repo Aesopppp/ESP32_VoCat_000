@@ -15,7 +15,6 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "tls_trust_anchor.h"
-#include "connect_latency_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -148,7 +147,7 @@ static bool http_begin(void *context, const char *url, const device_handshake_he
         .buffer_size_tx = 1024,
 #ifdef DEVICE_PLATFORM_TLS_CA
         .crt_bundle_attach = NULL,
-        .ca_cert = tls_trust_anchor_ca_pem(),
+        .cert_pem = tls_trust_anchor_ca_pem(),
 #else
         .crt_bundle_attach = esp_crt_bundle_attach,
 #endif
@@ -208,10 +207,8 @@ static void handshake_worker(void *arg)
         };
         char mac[18] = {0};
         wifi_service_get_mac_str(mac, sizeof(mac), ESP_MAC_WIFI_STA);
-        LAT_LOG("http-handshake-start");
         device_handshake_exchange(&http, &attempt->config, esp_app_get_description()->version,
                                    mac, &attempt->result);
-        LAT_LOG("http-handshake-finished");
         device_handshake_wipe(&attempt->config, sizeof(attempt->config));
         /* 只有一个 outstanding 请求，队列长度 1；结果发布时 HTTP 已彻底释放。
          * 所有权从 worker 转给 main_task，生产者之后不得访问 attempt。 */
@@ -322,17 +319,14 @@ void device_handshake_service_poll(bool network_available)
         s_seen_epoch = epoch;
         device_handshake_network_changed(&s_schedule, network_available);
         atomic_store(&s_cancel_generation, s_schedule.generation);
-        /* 不在这里 clear_snapshot()：network_changed() 已经把 ready 置 false，
-         * get_configuration() 会拒绝旧凭据，不会误用。但 token 本身可能还有效
-         * （TTL 1h，WiFi 抖动常常只有几秒）——清掉会逼唤醒时重做一次完整
-         * HTTPS 握手（实测额外 ~11s：TLS 6.4s + 设备空等 4.5s）。
-         * 新结果到达时 clear_snapshot() 会替换旧快照；被平台拒绝时下面清。 */
+        /* 保留旧快照直到新结果替换；ready 已清零，getter 不会返回它。
+         * 本版恢复联网仍会重新 HTTP 握手，尚未实现有效 token 的缓存复用。
+         * 永久失败或显式刷新/续期仍销毁快照，不通过抖动解除 blocked。 */
         if (s_schedule.blocked) clear_snapshot();
     }
     handshake_attempt_t *finished = NULL;
     if (s_results && xQueueReceive(s_results, &finished, 0) == pdTRUE) {
         s_pending = false;
-        LAT_LOG("http-handshake-result-dequeued");
         device_handshake_result_t *result = &finished->result;
         /* 新发 token 已不足安全窗口时停止并明确报错，避免 HTTP 200 续期风暴。 */
         if (result->success && device_handshake_token_remaining_ms(
@@ -361,6 +355,7 @@ void device_handshake_service_poll(bool network_available)
             ESP_LOGW(TAG, "DEV ONLY websocket.token=%s", result->response.websocket.token);
 #endif
         } else if (s_schedule.blocked) {
+            clear_snapshot();
             ESP_LOGE(TAG, "HTTP %d: %s; stopped until explicit configuration refresh/reboot",
                      result->status, result->reason);
         } else {

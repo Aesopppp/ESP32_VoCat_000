@@ -45,11 +45,10 @@ def main():
     wake = (root / "main/wake_word.c").read_text(encoding="utf-8")
     (output / "wake_fifo.inc").write_text("\n\n".join(extract(wake, name) for name in
         ("audio_buffer_frames_locked", "discard_oldest_audio_locked", "clear_audio_buffer_locked",
-         "afe_frame_energy", "buffer_afe_audio", "wake_word_set_audio_buffer_enabled",
-         "wake_word_set_pre_roll", "wake_word_mark_wake_boundary",
-         "wake_word_discard_audio_before", "wake_word_get_wake_boundary_sample",
-         "wake_word_set_preroll_replay_end", "wake_word_finish_pre_roll_replay",
-         "wake_word_get_preroll_replay_end")), encoding="utf-8")
+         "afe_frame_energy", "reset_first_phrase_detector_locked", "observe_first_phrase_locked",
+         "buffer_afe_audio", "wake_word_set_audio_buffer_enabled",
+         "wake_word_set_pre_roll", "wake_word_prepare_pre_roll_upload",
+         "wake_word_read_audio", "wake_word_confirm_audio_sent")), encoding="utf-8")
     cases = {
         "wifi-audio-checks": ["-Itests/audio_host", "-Iwork/speech-handoff",
                               "tests/audio_host/wifi_audio_checks.c"],
@@ -62,6 +61,12 @@ def main():
         "audio-stop-checks": ["-Itests/audio_host", "-Iwork/speech-handoff", "tests/audio_host/audio_stop_checks.c"],
         "audio-signal-checks": ["-Itests/audio_host", "-Iwork/speech-handoff", "tests/audio_host/audio_signal_checks.c"],
         "wake-fifo-checks": ["-Itests/audio_host", "-Iwork/speech-handoff", "tests/audio_host/wake_fifo_checks.c"],
+        "wake-fifo-disabled-checks": ["-DWAKE_WORD_CONNECT_PRE_ROLL_ENABLED=0",
+                                     "-Itests/audio_host", "-Iwork/speech-handoff",
+                                     "tests/audio_host/wake_fifo_checks.c"],
+        "wake-fifo-legacy-replay-checks": ["-DWAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED=0",
+                                          "-Itests/audio_host", "-Iwork/speech-handoff",
+                                          "tests/audio_host/wake_fifo_checks.c"],
         "ws-platform-checks": ["-Itests/audio_host", "-Itests/ui_host", "-Itests/host",
                                "-Imanaged_components/espressif__cjson/cJSON", "-Iwork/speech-handoff",
                                "tests/audio_host/ws_platform_checks.c",

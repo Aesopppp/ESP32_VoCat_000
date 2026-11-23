@@ -43,7 +43,6 @@
 #include "device_handshake_service.h"
 #include "device_mqtt_service.h"
 #include "log_service.h"
-#include "connect_latency_log.h"
 #include "led_service.h"
 #include "audio_out.h"
 #include "ws_service.h"
@@ -134,7 +133,6 @@ static esp_err_t system_init(void)
 
 /* Only this task changes session state or starts/stops the WS client. */
 static bool conversation_active;
-static bool s_pre_roll_used;
 /* 主任务拥有。结束对话/进入配网先清除此意图，迟到的错误不得重新拉起会话。 */
 static bool session_requested;
 /* 只持有建连时的任务通知；鉴权后交还 MQTT，不跟踪播报结果。 */
@@ -171,8 +169,6 @@ static void stop_session_audio(void)
         return;
     }
     cleanup_at_ms = 0;
-    wake_word_set_pre_roll(false);
-    wake_word_clear_audio_buffer();
 }
 
 static void end_conversation(const char *reason)
@@ -239,7 +235,6 @@ static void retry_voice_connection(int64_t now)
     waiting_for_credentials = false;
     ESP_LOGI(TAG, "Connecting WebSocket; credentials=%s",
              readiness == DEVICE_WS_READY ? "device handshake" : "legacy NVS (handshake disabled)");
-    LAT_LOG("credentials-ready");
     /* 先停旧连接，再整组复制配置；下一次 poll 清除握手快照不会影响本连接。 */
     esp_err_t err = ws_service_disconnect();
     if (err == ESP_OK) err = ws_service_set_credentials(
@@ -252,7 +247,6 @@ static void retry_voice_connection(int64_t now)
         err = ws_service_prepare_reminder(reminder_task->device_id, task_ids, reminder_task->count);
     }
     if (err == ESP_OK) err = ws_service_connect();
-    LAT_LOG("ws-service-connect-returned");
     if (err == ESP_OK) {
         retry_at_ms = 0;
         awaiting_voice_auth = false;
@@ -272,16 +266,9 @@ static void start_audio_session(const char *reason)
         recover_session("could not select listening AFE");
         return;
     }
-    /* pre-roll 只裁掉唤醒词本身，保留其后第一句话；非 pre-roll 路径仍整段清空。 */
-    if (s_pre_roll_used) {
-        wake_word_discard_audio_before(wake_word_get_wake_boundary_sample());
-    } else {
+    /* 唤醒检测任务已记录边界；补传由 FIFO 模块保护，不能在鉴权时丢掉首句。 */
+    if (!wake_word_prepare_pre_roll_upload()) {
         wake_word_clear_audio_buffer();
-    }
-    if (s_pre_roll_used) {
-        wake_word_audio_progress_t progress;
-        wake_word_get_audio_progress(&progress);
-        wake_word_set_preroll_replay_end(progress.written_end);
     }
     if (app_state_start_listening() != ESP_OK) {
         recover_session("could not start audio upload");
@@ -289,7 +276,6 @@ static void start_audio_session(const char *reason)
     }
     conversation_active = true;
     session_started_ms = (uint32_t)now_ms();
-    LAT_LOG("audio-upload-ready");
     resume_deadline_ms = 0;
     release_reminder(true); /* 仅表示通知已关联到会话，绝非播放完成 ACK。 */
     led_set_listening();
@@ -303,11 +289,13 @@ static void start_conversation(const char *reason)
 {
     if (cleanup_pending) return;
     if (provisioning_service_is_active()) {
+        wake_word_set_pre_roll(false);
         wake_word_reset();
         ESP_LOGI(TAG, "Talk ignored during Wi-Fi setup");
         return;
     }
     if (wifi_service_get_state() != WIFI_STATE_GOT_IP) {
+        wake_word_set_pre_roll(false);
         wake_word_reset();
         led_set_wifi_err();
         ESP_LOGW(TAG, "Talk ignored: Wi-Fi not ready");
@@ -320,28 +308,19 @@ static void start_conversation(const char *reason)
     session_requested = true;
     resume_deadline_ms = now_ms() + 60000;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
-    LAT_LOG("wake-requested");
+    /* 只有 WakeNet 检测任务可建立预录音边界；触屏、按键、提醒沿用旧行为。 */
+    if (strcmp(reason, "wake word") != 0) wake_word_set_pre_roll(false);
     if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
         end_conversation("could not prepare microphone");
         return;
     }
-    if (strcmp(reason, "wake word") == 0) {
-        wake_word_mark_wake_boundary();
-        s_pre_roll_used = true;
-        wake_word_set_pre_roll(true);
-        ESP_LOGI(TAG, "Pre-roll armed: recording during WebSocket handshake");
-    } else {
-        s_pre_roll_used = false;
-    }
     (void)wifi_service_set_audio_active(true);
     if (ws_service_get_state() == WS_STATE_CONNECTED) {
-        LAT_LOG("ws-already-connected");
         start_audio_session(reason);
     } else {
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         retry_at_ms = now_ms();
         led_set_connecting();
-        LAT_LOG("ws-connect-scheduled");
         ESP_LOGI(TAG, "Conversation requested: %s; opening WebSocket", reason);
     }
 }
@@ -583,7 +562,7 @@ static void main_task(void *arg)
                 /* 普通联网不打开 WS；重复 IP 事件不能打断正在进行的对话。 */
                 if (!session_requested) {
                     ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word before connecting");
-                    app_state_back_to_wait_wake();
+                    if (app_state_get() != APP_STATE_WAIT_WAKE) app_state_back_to_wait_wake();
                     led_set_waiting_wake();
                 }
                 break;
@@ -643,7 +622,6 @@ static void main_task(void *arg)
                 break;
             case EV_WS_CONNECTED:
                 ESP_LOGI(TAG, "WebSocket transport connected; authenticating");
-                LAT_LOG("ev-ws-transport-connected");
                 awaiting_voice_auth = true;
                 auth_deadline_ms = now_ms() + 10000;
                 if (ws_service_authenticate() != ESP_OK) recover_session("auth send failed");
@@ -651,7 +629,6 @@ static void main_task(void *arg)
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
-                LAT_LOG("ev-ws-auth-ok");
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
                 start_audio_session(reminder_task ? "MQTT wake" : "wake/reconnect");
                 break;

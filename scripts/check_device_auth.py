@@ -1,4 +1,4 @@
-"""运行生产凭据准备、WS 发送和主任务门禁回归；不请求平台、不读取私有配置。"""
+"""运行生产握手轮询、凭据准备、WS 发送和主任务门禁回归；不请求平台、不读取私有配置。"""
 import argparse
 from pathlib import Path
 import re
@@ -31,9 +31,10 @@ def main():
     output = root / "work/device-ws-auth"
     output.mkdir(parents=True, exist_ok=True)
     groups = {
-        "device_handshake_service.c": ("device_handshake_service_get_configuration",
+        "device_handshake_service.c": ("release_attempt", "clear_snapshot",
+            "device_handshake_service_get_configuration",
             "device_handshake_service_is_enabled", "device_handshake_service_renew_credentials",
-            "device_handshake_service_prepare_websocket"),
+            "device_handshake_service_prepare_websocket", "device_handshake_service_poll"),
         "ws_service.c": ("release_credentials", "ws_service_set_credentials", "ws_service_authenticate"),
         "app_main.c": ("handle_voice_auth_failure", "retry_voice_connection"),
     }
