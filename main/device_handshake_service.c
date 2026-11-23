@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "tls_trust_anchor.h"
+#include "connect_latency_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -207,8 +208,10 @@ static void handshake_worker(void *arg)
         };
         char mac[18] = {0};
         wifi_service_get_mac_str(mac, sizeof(mac), ESP_MAC_WIFI_STA);
+        LAT_LOG("http-handshake-start");
         device_handshake_exchange(&http, &attempt->config, esp_app_get_description()->version,
                                    mac, &attempt->result);
+        LAT_LOG("http-handshake-finished");
         device_handshake_wipe(&attempt->config, sizeof(attempt->config));
         /* 只有一个 outstanding 请求，队列长度 1；结果发布时 HTTP 已彻底释放。
          * 所有权从 worker 转给 main_task，生产者之后不得访问 attempt。 */
@@ -329,6 +332,7 @@ void device_handshake_service_poll(bool network_available)
     handshake_attempt_t *finished = NULL;
     if (s_results && xQueueReceive(s_results, &finished, 0) == pdTRUE) {
         s_pending = false;
+        LAT_LOG("http-handshake-result-dequeued");
         device_handshake_result_t *result = &finished->result;
         /* 新发 token 已不足安全窗口时停止并明确报错，避免 HTTP 200 续期风暴。 */
         if (result->success && device_handshake_token_remaining_ms(

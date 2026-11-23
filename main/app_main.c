@@ -43,6 +43,7 @@
 #include "device_handshake_service.h"
 #include "device_mqtt_service.h"
 #include "log_service.h"
+#include "connect_latency_log.h"
 #include "led_service.h"
 #include "audio_out.h"
 #include "ws_service.h"
@@ -238,6 +239,7 @@ static void retry_voice_connection(int64_t now)
     waiting_for_credentials = false;
     ESP_LOGI(TAG, "Connecting WebSocket; credentials=%s",
              readiness == DEVICE_WS_READY ? "device handshake" : "legacy NVS (handshake disabled)");
+    LAT_LOG("credentials-ready");
     /* 先停旧连接，再整组复制配置；下一次 poll 清除握手快照不会影响本连接。 */
     esp_err_t err = ws_service_disconnect();
     if (err == ESP_OK) err = ws_service_set_credentials(
@@ -250,6 +252,7 @@ static void retry_voice_connection(int64_t now)
         err = ws_service_prepare_reminder(reminder_task->device_id, task_ids, reminder_task->count);
     }
     if (err == ESP_OK) err = ws_service_connect();
+    LAT_LOG("ws-service-connect-returned");
     if (err == ESP_OK) {
         retry_at_ms = 0;
         awaiting_voice_auth = false;
@@ -281,6 +284,7 @@ static void start_audio_session(const char *reason)
     }
     conversation_active = true;
     session_started_ms = (uint32_t)now_ms();
+    LAT_LOG("audio-upload-ready");
     resume_deadline_ms = 0;
     release_reminder(true); /* 仅表示通知已关联到会话，绝非播放完成 ACK。 */
     led_set_listening();
@@ -311,6 +315,7 @@ static void start_conversation(const char *reason)
     session_requested = true;
     resume_deadline_ms = now_ms() + 60000;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
+    LAT_LOG("wake-requested");
     if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
         end_conversation("could not prepare microphone");
         return;
@@ -325,11 +330,13 @@ static void start_conversation(const char *reason)
     }
     (void)wifi_service_set_audio_active(true);
     if (ws_service_get_state() == WS_STATE_CONNECTED) {
+        LAT_LOG("ws-already-connected");
         start_audio_session(reason);
     } else {
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         retry_at_ms = now_ms();
         led_set_connecting();
+        LAT_LOG("ws-connect-scheduled");
         ESP_LOGI(TAG, "Conversation requested: %s; opening WebSocket", reason);
     }
 }
@@ -631,6 +638,7 @@ static void main_task(void *arg)
                 break;
             case EV_WS_CONNECTED:
                 ESP_LOGI(TAG, "WebSocket transport connected; authenticating");
+                LAT_LOG("ev-ws-transport-connected");
                 awaiting_voice_auth = true;
                 auth_deadline_ms = now_ms() + 10000;
                 if (ws_service_authenticate() != ESP_OK) recover_session("auth send failed");
@@ -638,6 +646,7 @@ static void main_task(void *arg)
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
+                LAT_LOG("ev-ws-auth-ok");
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
                 start_audio_session(reminder_task ? "MQTT wake" : "wake/reconnect");
                 break;
