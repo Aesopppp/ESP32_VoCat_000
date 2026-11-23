@@ -51,6 +51,8 @@ static void log_connection_memory(const char *phase) { CHECK(phase!=NULL); }
 static void log_transport_error(const char *phase,const void *event) { CHECK(phase && event); }
 static bool audio_out_stop_requested(void) { return stop_flag; }
 static void audio_out_set_streaming(bool active) { CHECK(active); ++started; }
+static void latency_log_event(const char *event, uint32_t ms)
+{ CHECK(event!=NULL); (void)ms; }
 static int audio_out_play_opus(const uint8_t *data,size_t len)
 {
     CHECK(data!=NULL && len!=0);

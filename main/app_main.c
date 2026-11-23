@@ -43,6 +43,7 @@
 #include "device_handshake_service.h"
 #include "device_mqtt_service.h"
 #include "log_service.h"
+#include "latency_log.h"
 #include "led_service.h"
 #include "audio_out.h"
 #include "ws_service.h"
@@ -622,6 +623,7 @@ static void main_task(void *arg)
                 break;
             case EV_WS_CONNECTED:
                 ESP_LOGI(TAG, "WebSocket transport connected; authenticating");
+                latency_log_event("ws-tls-and-handshake-done", (uint32_t)now_ms());
                 awaiting_voice_auth = true;
                 auth_deadline_ms = now_ms() + 10000;
                 if (ws_service_authenticate() != ESP_OK) recover_session("auth send failed");
@@ -630,6 +632,8 @@ static void main_task(void *arg)
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
+                latency_log_event("audio-upload-ready", (uint32_t)now_ms());
+                latency_log_mark_upload_phase();
                 start_audio_session(reminder_task ? "MQTT wake" : "wake/reconnect");
                 break;
             case EV_WS_DISCONNECTED:
@@ -650,6 +654,8 @@ static void main_task(void *arg)
             case EV_AUDIO_WAKE_DETECTED:
                 if (!session_requested) {
                     device_mqtt_service_on_wake();
+                    latency_log_begin((uint32_t)now_ms(), (uint32_t)esp_random());
+                    latency_log_event("wake-requested", (uint32_t)now_ms());
                     start_conversation("wake word");
                 }
                 break;

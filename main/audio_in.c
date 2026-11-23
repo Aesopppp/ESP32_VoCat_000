@@ -18,6 +18,7 @@
 #include "wake_word.h"
 #include "ws_service.h"
 #include "wifi_service.h"
+#include "latency_log.h"
 #include "opus_codec.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -347,6 +348,9 @@ static bool transmit_next_packet(audio_in_handle_t h)
         h->sent_end = sample_end;
         h->tx_head = (h->tx_head + 1) % AUDIO_TX_QUEUE_PACKETS;
         --h->tx_count;
+        if (latency_log_first_live_uplink_pending()) {
+            latency_log_event("first-live-uplink", (uint32_t)(esp_timer_get_time() / 1000));
+        }
     }
     xSemaphoreGive(h->lock);
     if (err == ESP_OK) wake_word_confirm_audio_sent(sample_end);

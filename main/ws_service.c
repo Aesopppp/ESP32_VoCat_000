@@ -4,6 +4,7 @@
 #include "ws_rx_policy.h"
 #include "event_bus.h"
 #include "cfg_service.h"
+#include "latency_log.h"
 #include "board_config.h"
 #include "esp_crt_bundle.h"
 #include "tls_trust_anchor.h"
@@ -255,8 +256,11 @@ static void handle_frame(const rx_frame_t *packet)
                 /* 用户结束会话可解除 PCM 背压；不能把正常关闭变成再次重连。 */
                 if (current(packet) && !audio_out_stop_requested())
                     publish(EV_WS_SERVER_ERROR, packet->generation);
-            } else if (samples > 0 && ++played_frames == 1) {
-                ESP_LOGI(TAG, "Continuous audio accepted; microphone upload remains active");
+            } else if (samples > 0) {
+                if (++played_frames == 1)
+                    ESP_LOGI(TAG, "Continuous audio accepted; microphone upload remains active");
+                if (played_frames == 1)
+                    latency_log_event("agent-first-audio", packet.received_ms);
             }
         }
         xSemaphoreGive(playback_lock);
@@ -276,6 +280,7 @@ static void handle_frame(const rx_frame_t *packet)
     }
     if (msg.evt == PROTO_EVT_PROXY_CONNECTED && state == WS_STATE_AUTHING) {
         state = WS_STATE_CONNECTED;
+        latency_log_event("proxy-connected", packet.received_ms);
         publish(EV_WS_AUTH_OK, packet->generation);
     } else if (msg.evt == PROTO_EVT_ERROR) {
         log_server_error(&msg);
@@ -325,10 +330,12 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
     if (id == WEBSOCKET_EVENT_BEFORE_CONNECT) {
         /* 已创建网络任务/transport，尚未分配本轮 TLS 握手内存。 */
         log_connection_memory("before-tls");
+        latency_log_event("ws-before-tcp-connect", (uint32_t)(esp_timer_get_time() / 1000));
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
         state = WS_STATE_AUTHING;
         reset_speech_status();
         log_connection_memory("connected");
+        latency_log_event("ws-transport-connected", (uint32_t)(esp_timer_get_time() / 1000));
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
         state = WS_STATE_DISCONNECTED;
@@ -377,6 +384,13 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
              * 认证前仍保留 FIFO 顺序；后续 worker 用序号防止旧事件反向覆盖。 */
             bool speech_handled = packet.opcode == 1 && state == WS_STATE_CONNECTED &&
                 observe_speech_event(proto_parse_speech_event((char *)packet.data), &packet);
+            if (packet.opcode == 1 && state == WS_STATE_CONNECTED) {
+                proto_msg_t timing_msg;
+                if (proto_parse_json((char *)packet.data, &timing_msg) == PROTO_OK) {
+                    if (timing_msg.evt == PROTO_EVT_SPEECH_STOPPED)
+                        latency_log_event("speech-stopped", packet.received_ms);
+                }
+            }
             if (speech_handled) release_rx_frame(packet.data, packet.len);
             else enqueue_rx_frame(&packet);
             frame = NULL; frame_size = received = 0;

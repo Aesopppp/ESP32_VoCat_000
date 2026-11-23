@@ -70,6 +70,9 @@ static void led_set_wifi_err(void) {}
 static void led_set_listening(void) {}
 static void led_set_speaking(void) {}
 static void led_set_connecting(void) {}
+static void latency_log_begin(uint32_t ms, uint32_t seed) { (void)ms; (void)seed; }
+static void latency_log_event(const char *event, uint32_t ms) { CHECK(event!=NULL); (void)ms; }
+static void latency_log_mark_upload_phase(void) {}
 esp_err_t app_state_start_listening(void)
 {
     ++starts;

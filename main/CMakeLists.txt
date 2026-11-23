@@ -31,6 +31,7 @@ idf_component_register(
         "device_mqtt_storage.c"
         "device_mqtt_service.c"
         "log_service.c"
+        "latency_log.c"
         "provisioning_service.c"
         "tls_trust_anchor.c"
     INCLUDE_DIRS "."
