@@ -105,6 +105,8 @@ esp_err_t app_state_back_to_wait_wake(void)
         ESP_LOGE(TAG, "audio_in_stop failed: %s", esp_err_to_name(err));
         return err; /* 上传任务仍持有当前采样位置，不能先切模式清空它的 FIFO。 */
     }
+    /* 在允许下一次唤醒之前清理。发布 WAIT_WAKE 后再清会误删新唤醒的首句。 */
+    wake_word_clear_audio_buffer();
     /* 停上传后再切 AFE，保持缓存清空与采样计数复位的生命周期一致。 */
     if (prev != APP_STATE_WAIT_WAKE) {
         if (wake_word_set_mode(WAKE_WORD_MODE_WAKE) == ESP_OK) {
@@ -112,8 +114,8 @@ esp_err_t app_state_back_to_wait_wake(void)
         }
     }
 
-    app_state_set(APP_STATE_WAIT_WAKE);
     wake_word_reset();
+    app_state_set(APP_STATE_WAIT_WAKE);
     ESP_LOGI(TAG, "Back to WAIT_WAKE, waiting for wake word...");
     return ESP_OK;
 }

@@ -8,13 +8,24 @@
 #include "../../main/wifi_service.h"
 #include "../../main/wake_word.h"
 #include "../../main/device_mqtt_service.h"
+#include "../../main/device_handshake_service.h"
+#include "../../main/device_preconnect_config.h"
 #include "../../main/app_state.h"
 #include "../../main/session_policy.h"
 
 static unsigned checks, takes, stops, closes, clears, releases, starts, recoveries, wakes;
 static bool conversation_active, session_requested, cleanup_pending;
-static bool s_pre_roll_used;
-static uint32_t s_wake_boundary_sample;
+static bool pre_roll_active, mode_kept_pre_roll, wake_on_return_to_idle;
+static unsigned pre_roll_prepares, pre_roll_cancels;
+static bool preconnect_owned, preconnect_unsupported, valid_lease, hot_pre_roll;
+static bool refresh_due;
+static bool preconnect_token_renewed, preconnect_token_blocked;
+static unsigned preconnect_epoch, preconnect_failures, http_epoch;
+static int64_t preconnect_deadline_ms, preconnect_poll_at_ms;
+static unsigned dials, preauth, activations, prepared_tasks;
+static device_handshake_response_t configuration;
+static device_ws_readiness_t readiness;
+static esp_err_t activation_result;
 static int64_t cleanup_at_ms;
 static bool voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
 static bool provisioning, voice_enabled, dispatch_allowed, output_speaking, audio_active;
@@ -34,17 +45,43 @@ static int64_t now_ms(void) { return clock_ms; }
 bool provisioning_service_is_active(void) { return provisioning; }
 wifi_state_t wifi_service_get_state(void) { return wifi_state; }
 ws_conn_state_t ws_service_get_state(void) { return ws_state; }
+static unsigned esp_random(void) { return 17; }
+device_ws_readiness_t device_handshake_service_prepare_websocket(const device_handshake_response_t **cfg)
+{ *cfg = readiness == DEVICE_WS_READY ? &configuration : NULL; return readiness; }
+unsigned device_handshake_service_websocket_epoch(void) { return http_epoch; }
+bool device_handshake_service_renew_credentials(void)
+{ if (readiness!=DEVICE_WS_READY) return false; ++http_epoch; readiness=DEVICE_WS_WAITING; return true; }
+esp_err_t ws_service_set_credentials(const char *url, const char *token)
+{ CHECK(ws_state==WS_STATE_DISCONNECTED && !strcmp(url,"wss://example") && !strcmp(token,"test")); return ESP_OK; }
+esp_err_t ws_service_prepare_preconnect(const char *id)
+{ CHECK(!strcmp(id,"dev_test")); return ESP_OK; }
+esp_err_t ws_service_connect(void) { ++dials; ws_state=WS_STATE_CONNECTING; return ESP_OK; }
+esp_err_t ws_service_authenticate(void)
+{ CHECK(ws_state==WS_STATE_PREAUTHING); ++preauth; return ESP_OK; }
+esp_err_t ws_service_prepare_reminder(const char *id,const char *const *tasks,size_t count)
+{ CHECK(!strcmp(id,"dev_test") && count==2 && !strcmp(tasks[0],"a") && !strcmp(tasks[1],"b"));
+  ++prepared_tasks; return ESP_OK; }
+bool ws_service_preconnect_valid(void) { return valid_lease && ws_state==WS_STATE_PRECONNECTED; }
+bool ws_service_preconnect_refresh_due(void) { return refresh_due && ws_state==WS_STATE_PRECONNECTED; }
+esp_err_t ws_service_activate_preconnection(void)
+{ CHECK(ws_state==WS_STATE_PRECONNECTED); ++activations;
+  if (activation_result==ESP_OK) ws_state=WS_STATE_ACTIVATING;
+  return activation_result; }
 void ws_service_get_speech_status(ws_speech_status_t *status) { *status=platform_speech; }
 esp_err_t wifi_service_set_audio_active(bool active) { audio_active=active; return ESP_OK; }
 app_state_t app_state_get(void) { return current_state; }
 app_state_t app_state_set(app_state_t s) { app_state_t old=current_state; current_state=s; return old; }
-esp_err_t wake_word_set_mode(wake_word_mode_t mode) { afe_mode=mode; return afe_result; }
+esp_err_t wake_word_set_mode(wake_word_mode_t mode)
+{ mode_kept_pre_roll=pre_roll_active; afe_mode=mode; return afe_result; }
 wake_word_mode_t wake_word_get_mode(void) { return afe_mode; }
 void wake_word_reset(void) {}
-void wake_word_clear_audio_buffer(void) { ++clears; input_voice_ms=0; }
-void wake_word_set_pre_roll(bool enabled) { (void)enabled; }
-void wake_word_mark_wake_boundary(void) { s_wake_boundary_sample=1; }
-void wake_word_discard_audio_before(uint32_t sample_end) { (void)sample_end; }
+void wake_word_clear_audio_buffer(void) { ++clears; input_voice_ms=0; pre_roll_active=false; }
+void wake_word_set_pre_roll(bool enabled)
+{ if(!enabled) { ++pre_roll_cancels; pre_roll_active=false; } }
+void wake_word_select_hot_pre_roll(void) { hot_pre_roll=pre_roll_active; }
+void wake_word_fallback_cold_pre_roll(void) { hot_pre_roll=false; }
+bool wake_word_prepare_pre_roll_upload(void)
+{ ++pre_roll_prepares; return pre_roll_active; }
 audio_in_handle_t audio_in_get_handle(void) { return (void*)1; }
 esp_err_t audio_in_stop(audio_in_handle_t h)
 { CHECK(h==(void*)1); ++stops; upload.running=audio_active=false; return ESP_OK; }
@@ -72,19 +109,32 @@ esp_err_t app_state_start_listening(void)
 {
     ++starts;
     if(upload_result!=ESP_OK) return upload_result;
-    CHECK(ws_state==WS_STATE_CONNECTED || ws_state==WS_STATE_PRECONNECTED);
+    CHECK(ws_state==WS_STATE_CONNECTED);
     current_state=APP_STATE_LISTENING; upload.running=true; return ESP_OK;
 }
 esp_err_t app_state_back_to_wait_wake(void)
 { if(idle_result!=ESP_OK) return idle_result;
-  current_state=APP_STATE_WAIT_WAKE; afe_mode=WAKE_WORD_MODE_WAKE; return ESP_OK; }
+  wake_word_clear_audio_buffer();
+  current_state=APP_STATE_WAIT_WAKE; afe_mode=WAKE_WORD_MODE_WAKE;
+  if(wake_on_return_to_idle) pre_roll_active=true; /* 模拟发布待机后立即检测到新唤醒。 */
+  return ESP_OK; }
 static void recover_session(const char *reason)
 { CHECK(reason!=NULL); ++recoveries; conversation_active=false; }
 #include "app_session.inc"
 
 static void reset(void)
 {
+    preconnect_owned=preconnect_unsupported=hot_pre_roll=false;
+    preconnect_token_renewed=preconnect_token_blocked=false;
+    preconnect_epoch=preconnect_failures=dials=preauth=activations=prepared_tasks=0;
+    preconnect_deadline_ms=preconnect_poll_at_ms=0; http_epoch=1;
+    valid_lease=true; refresh_due=false; activation_result=ESP_OK; readiness=DEVICE_WS_READY;
+    strcpy(configuration.mqtt.username,"dev_test");
+    strcpy(configuration.websocket.url,"wss://example"); strcpy(configuration.websocket.token,"test");
+    strcpy(batch.device_id,"dev_test"); strcpy(batch.task_ids[0],"a"); strcpy(batch.task_ids[1],"b");
     conversation_active=session_requested=cleanup_pending=false;
+    pre_roll_active=mode_kept_pre_roll=wake_on_return_to_idle=false;
+    pre_roll_prepares=pre_roll_cancels=0;
     cleanup_at_ms=0;
     voice_auth_refresh_used=awaiting_voice_auth=waiting_for_credentials=false;
     provisioning=output_speaking=audio_active=false;
@@ -163,6 +213,48 @@ static void conversation_checks(void)
     reset(); conversation_active=session_requested=true; ws_state=WS_STATE_CONNECTED;
     upload.running=false; poll_conversation(); CHECK(recoveries==1);
 }
+static void wake_pre_roll_checks(void)
+{
+    /* 检测任务在发布 wake 事件前已保护 FIFO；主任务不得在切模式时取消。 */
+    reset(); pre_roll_active=true; start_conversation("wake word");
+    CHECK(session_requested && !conversation_active && mode_kept_pre_roll);
+    CHECK(pre_roll_active && pre_roll_cancels==0 && clears==0);
+    start_conversation("wake word");
+    CHECK(pre_roll_active && pre_roll_cancels==0 && clears==0);
+    clock_ms+=5000; ws_state=WS_STATE_CONNECTED; start_audio_session("wake auth");
+    CHECK(conversation_active && upload.running && pre_roll_prepares==1 && clears==0);
+    CHECK(pre_roll_active); /* 鉴权不能提前解除 FIFO 的补传保护。 */
+    start_audio_session("duplicate auth");
+    CHECK(pre_roll_prepares==1 && starts==1 && clears==0);
+    end_conversation("touch");
+    CHECK(!pre_roll_active && clears==1);
+    start_conversation("REC button");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("button auth");
+    CHECK(conversation_active && !pre_roll_active && clears==2);
+    /* 开关关闭/没有检测边界时回退旧清空路径，不能伪造边界。 */
+    reset(); start_conversation("wake word");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("auth without pre-roll");
+    CHECK(conversation_active && clears==1);
+    const char *sources[]={"touch", "REC button", "MQTT notification"};
+    for(unsigned i=0;i<sizeof(sources)/sizeof(sources[0]);++i) {
+        reset(); pre_roll_active=true; start_conversation(sources[i]);
+        CHECK(!pre_roll_active && !mode_kept_pre_roll && pre_roll_cancels==1);
+        ws_state=WS_STATE_CONNECTED; start_audio_session("non-wake auth");
+        CHECK(conversation_active && upload.running && clears==1);
+    }
+    reset(); pre_roll_active=true; provisioning=true; start_conversation("wake word");
+    CHECK(!session_requested && !pre_roll_active && pre_roll_cancels==1);
+    reset(); pre_roll_active=true; wifi_state=WIFI_STATE_DISCONNECTED;
+    start_conversation("wake word");
+    CHECK(!session_requested && !pre_roll_active && pre_roll_cancels==1);
+    reset(); pre_roll_active=true; start_conversation("wake word");
+    ws_state=WS_STATE_CONNECTED; start_audio_session("auth");
+    wake_on_return_to_idle=true; end_conversation("touch then immediate wake");
+    CHECK(pre_roll_active && clears==1); /* 旧会话收尾不能抹掉新边界。 */
+    start_conversation("wake word"); ws_state=WS_STATE_CONNECTED;
+    start_audio_session("next auth");
+    CHECK(conversation_active && pre_roll_active && clears==1);
+}
 static void task_checks(void)
 {
     reset(); available=&batch; poll_reminder();
@@ -206,8 +298,157 @@ static void touch_checks(void)
     reset(); provisioning=true; handle_talk_action("menu");
     CHECK(!session_requested && starts==0 && closes==0 && wakes==0);
 }
+/* Production handlers with an idle, preauthenticated WebSocket. */
+static void standby_transport(void)
+{
+    poll_preconnection(clock_ms,false);
+    CHECK(preconnect_owned && dials==1 && !session_requested && !conversation_active);
+    CHECK(current_state==APP_STATE_WAIT_WAKE && afe_mode==WAKE_WORD_MODE_WAKE && !audio_active);
+    ws_state=WS_STATE_PREAUTHING; CHECK(handle_preconnection_event(EV_WS_CONNECTED));
+    CHECK(preauth==1 && !activations && !starts);
+}
+static void standby_ready(void)
+{
+    standby_transport();
+    ws_state=WS_STATE_PRECONNECTED;
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(!starts && !activations && preconnect_owned && !preconnect_deadline_ms);
+}
+static void standby_refresh_checks(void)
+{
+    reset();
+    standby_ready();
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    CHECK(dials==1 && preconnect_owned);
+
+    refresh_due=true;
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    CHECK(dials==2 && preconnect_owned && ws_state==WS_STATE_CONNECTING);
+    CHECK(!preconnect_failures && !retry_at_ms && http_epoch==1);
+    CHECK(!starts && !stops && !clears && !session_requested && !audio_active);
+    CHECK(current_state==APP_STATE_WAIT_WAKE && afe_mode==WAKE_WORD_MODE_WAKE);
+
+    /* The old standby socket is already closed. Preserve the first phrase on the new one. */
+    pre_roll_active=true;
+    start_conversation("wake word");
+    CHECK(pre_roll_active && !hot_pre_roll && !activations && !starts);
+    ws_state=WS_STATE_PREAUTHING;
+    CHECK(handle_preconnection_event(EV_WS_CONNECTED));
+    refresh_due=false;
+    ws_state=WS_STATE_PRECONNECTED;
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(activations==1 && dials==2 && !starts && !clears);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("wake during standby refresh");
+    CHECK(upload.running && pre_roll_prepares==1 && !clears);
+
+    /* If activation is requested before the old socket is closed, use its remaining lease. */
+    reset();
+    standby_ready();
+    refresh_due=pre_roll_active=true;
+    start_conversation("wake word");
+    CHECK(activations==1 && dials==1 && hot_pre_roll && !starts && !preconnect_failures);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("wake at refresh window");
+    clock_ms+=600000;
+    poll_preconnection(clock_ms,false);
+    CHECK(conversation_active && upload.running && dials==1 && !stops);
+
+    reset();
+    standby_ready();
+    refresh_due=true;
+    available=&batch;
+    poll_reminder();
+    CHECK(activations==1 && dials==1 && prepared_tasks==1 && reminder_task==&batch);
+    CHECK(!starts && !releases && !preconnect_failures);
+
+    reset();
+    standby_ready();
+    refresh_due=true;
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    available=&batch;
+    poll_reminder();
+    CHECK(reminder_task==&batch && !prepared_tasks && !activations && !releases);
+    ws_state=WS_STATE_PREAUTHING;
+    CHECK(handle_preconnection_event(EV_WS_CONNECTED));
+    refresh_due=false;
+    ws_state=WS_STATE_PRECONNECTED;
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(prepared_tasks==1 && activations==1 && dials==2 && reminder_task==&batch);
+}
+static void standby_checks(void)
+{
+    CHECK(tagged_ws_event(EV_WS_PRECONNECT_READY) && tagged_ws_event(EV_WS_SESSION_CLOSED));
+    CHECK(tagged_ws_event(EV_WS_PRECONNECT_UNSUPPORTED) && !tagged_ws_event(EV_AUDIO_WAKE_DETECTED));
+    reset(); readiness=DEVICE_WS_WAITING; poll_preconnection(clock_ms,false);
+    CHECK(!dials && !preconnect_owned);
+    readiness=DEVICE_WS_DISABLED; clock_ms+=500; poll_preconnection(clock_ms,false); CHECK(!dials);
+    reset(); standby_ready(); pre_roll_active=true;
+    start_conversation("wake word"); CHECK(pre_roll_active && hot_pre_roll && activations==1 && !starts);
+    CHECK(!retry_at_ms && current_state==APP_STATE_WS_CONNECTING_WAKE && dials==1);
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(preconnect_deadline_ms && activations==1 && !starts);
+    start_conversation("wake word"); CHECK(activations==1);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK) && !preconnect_owned);
+    start_audio_session("warm auth"); CHECK(starts==1 && conversation_active && upload.running);
+    poll_preconnection(clock_ms+900000,false); CHECK(dials==1);
+    reset(); standby_transport(); pre_roll_active=true; start_conversation("wake word");
+    CHECK(session_requested && pre_roll_active && !hot_pre_roll && !activations && !retry_at_ms);
+    ws_state=WS_STATE_PRECONNECTED; CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(activations==1 && !starts && dials==1);
+    reset(); standby_transport(); CHECK(handle_preconnection_event(EV_WS_PRECONNECT_UNSUPPORTED));
+    CHECK(preconnect_unsupported && !preconnect_owned && !session_requested && !starts);
+    poll_preconnection(clock_ms+600000,false); CHECK(dials==1);
+    start_conversation("wake word"); CHECK(retry_at_ms && session_requested && !activations);
+    reset(); standby_transport(); CHECK(handle_preconnection_event(EV_WS_PRECONNECT_REJECTED));
+    CHECK(!preconnect_owned && !session_requested && !retry_at_ms);
+    poll_preconnection(clock_ms+4900,false); CHECK(dials==1);
+    clock_ms+=7000; poll_preconnection(clock_ms,false); CHECK(dials==2 && preconnect_owned);
+    reset(); standby_transport(); CHECK(handle_preconnection_event(EV_WS_AUTH_FAILED));
+    CHECK(preconnect_token_renewed && !preconnect_token_blocked && http_epoch==2 && !starts);
+    readiness=DEVICE_WS_READY; clock_ms+=7000; poll_preconnection(clock_ms,false);
+    CHECK(preconnect_owned && dials==2); CHECK(handle_preconnection_event(EV_WS_AUTH_FAILED));
+    CHECK(preconnect_token_blocked && http_epoch==2); clock_ms+=100000;
+    poll_preconnection(clock_ms,false); CHECK(!preconnect_owned && dials==2);
+    ++http_epoch; clock_ms+=501; poll_preconnection(clock_ms,false); CHECK(dials==3 && preconnect_owned);
+    reset(); standby_ready(); ++http_epoch; pre_roll_active=true; start_conversation("wake word");
+    CHECK(!preconnect_owned && retry_at_ms && !activations && pre_roll_active && !hot_pre_roll);
+    reset(); standby_ready(); readiness=DEVICE_WS_WAITING; clock_ms+=501;
+    poll_preconnection(clock_ms,false); CHECK(!preconnect_owned && !session_requested);
+    reset(); standby_ready(); valid_lease=false; start_conversation("touch");
+    CHECK(!preconnect_owned && session_requested && retry_at_ms && !activations);
+    reset(); standby_ready(); activation_result=ESP_FAIL; pre_roll_active=true; start_conversation("wake word");
+    CHECK(!preconnect_owned && retry_at_ms && !starts && pre_roll_active && !hot_pre_roll);
+    reset(); standby_ready(); available=&batch; poll_reminder();
+    CHECK(reminder_task==&batch && activations==1 && prepared_tasks==1 && !starts && !hot_pre_roll);
+    ws_state=WS_STATE_CONNECTED; CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("reminder"); CHECK(releases==1 && last_handled && starts==1);
+    reset(); standby_transport(); start_conversation("touch"); clock_ms+=1500;
+    poll_preconnection(clock_ms,false); CHECK(!preconnect_owned && retry_at_ms && !starts);
+    reset(); standby_ready(); start_conversation("touch"); handle_talk_action("cancel activation");
+    CHECK(!preconnect_owned && !session_requested && !retry_at_ms && !starts);
+    reset(); standby_ready(); start_conversation("touch");
+    CHECK(!handle_preconnection_event(EV_WS_SESSION_CLOSED));
+    end_conversation("platform closed"); CHECK(!retry_at_ms && !preconnect_owned);
+}
 int main(void)
 {
-    silence_checks(); conversation_checks(); task_checks(); touch_checks();
+    silence_checks(); conversation_checks(); wake_pre_roll_checks(); task_checks(); touch_checks();
+    if (DEVICE_WS_PRECONNECT_ENABLED) {
+        standby_checks();
+        standby_refresh_checks();
+    }
+    else {
+        reset(); poll_preconnection(clock_ms, true);
+        CHECK(!dials && !preconnect_owned && !session_requested);
+        start_conversation("wake word");
+        CHECK(!activations && session_requested && retry_at_ms == clock_ms);
+    }
     printf("PASS: %u unified app session checks\n",checks); return 0;
 }

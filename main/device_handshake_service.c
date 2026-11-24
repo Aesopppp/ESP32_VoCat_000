@@ -278,6 +278,7 @@ const device_handshake_response_t *device_handshake_service_get_configuration(vo
 
 bool device_handshake_service_is_enabled(void) { return !s_disabled; }
 bool device_handshake_service_is_blocked(void) { return !s_initialized || s_schedule.blocked; }
+unsigned device_handshake_service_websocket_epoch(void) { return s_schedule.generation; }
 unsigned device_handshake_service_mqtt_epoch(void) { return s_mqtt_epoch; }
 
 bool device_handshake_service_renew_credentials(void)
@@ -319,11 +320,9 @@ void device_handshake_service_poll(bool network_available)
         s_seen_epoch = epoch;
         device_handshake_network_changed(&s_schedule, network_available);
         atomic_store(&s_cancel_generation, s_schedule.generation);
-        /* 不在这里 clear_snapshot()：network_changed() 已经把 ready 置 false，
-         * get_configuration() 会拒绝旧凭据，不会误用。但 token 本身可能还有效
-         * （TTL 1h，WiFi 抖动常常只有几秒）——清掉会逼唤醒时重做一次完整
-         * HTTPS 握手（实测额外 ~11s：TLS 6.4s + 设备空等 4.5s）。
-         * 新结果到达时 clear_snapshot() 会替换旧快照；被平台拒绝时下面清。 */
+        /* 保留旧快照直到新结果替换；ready 已清零，getter 不会返回它。
+         * 本版恢复联网仍会重新 HTTP 握手，尚未实现有效 token 的缓存复用。
+         * 永久失败或显式刷新/续期仍销毁快照，不通过抖动解除 blocked。 */
         if (s_schedule.blocked) clear_snapshot();
     }
     handshake_attempt_t *finished = NULL;
@@ -357,6 +356,7 @@ void device_handshake_service_poll(bool network_available)
             ESP_LOGW(TAG, "DEV ONLY websocket.token=%s", result->response.websocket.token);
 #endif
         } else if (s_schedule.blocked) {
+            clear_snapshot();
             ESP_LOGE(TAG, "HTTP %d: %s; stopped until explicit configuration refresh/reboot",
                      result->status, result->reason);
         } else {

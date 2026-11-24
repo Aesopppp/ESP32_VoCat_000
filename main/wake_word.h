@@ -34,11 +34,27 @@ extern "C" {
  * 常量配置
  * ========================================================================= */
 
-/** PSRAM FIFO backing store including per-item headers. Actual live audio is
- * bounded to AUDIO_UPLOAD_FIFO_MS in the producer, independent of capacity. */
+/* 改为 0 即恢复旧行为：建连期间不缓存，鉴权后只上传实时语音。 */
+#ifndef WAKE_WORD_CONNECT_PRE_ROLL_ENABLED
+#define WAKE_WORD_CONNECT_PRE_ROLL_ENABLED 1
+#endif
+
+/* 改为 0 保留原来的整段预录音追赶方式；不影响总 pre-roll 开关。 */
+#ifndef WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED
+#define WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED 1
+#endif
+/* 仅使用 LITE AFE 的有效人声来开启首句判定；WAKE 的残留 VAD 不算首句。
+ * AFE 自身已经做静音持续时间判定；这里只额外容忍短暂无声帧。
+ * 此值不是原始麦克风的总句尾等待时间，也不参与平台打断。 */
+#define WAKE_WORD_FIRST_PHRASE_SILENCE_MS 160u
+#define WAKE_WORD_LIVE_RB_ITEM_COUNT 16u  /* 16 × 32 ms = 512 ms */
+
+/** PSRAM FIFO backing store including per-item headers. Wake-to-connect replay
+ * may use the full capacity; ordinary live audio is bounded to 512 ms. */
 #define WAKE_WORD_RB_ITEM_SIZE  512   /* 512 × int16 = 1024 bytes/帧 */
 #define WAKE_WORD_RB_ITEM_COUNT 320
 #define WAKE_WORD_RB_TOTAL_SIZE ((WAKE_WORD_RB_ITEM_SIZE * sizeof(int16_t) + 8) * WAKE_WORD_RB_ITEM_COUNT)
+#define WAKE_WORD_LIVE_RB_TOTAL_SIZE ((WAKE_WORD_RB_ITEM_SIZE * sizeof(int16_t) + 8) * WAKE_WORD_LIVE_RB_ITEM_COUNT)
 
 /** feed_Task 栈深度 (AFE I²S 喂流，与参考例程一致) */
 #define WAKE_WORD_FEED_STACK    (8 * 1024)
@@ -105,8 +121,10 @@ void wake_word_deinit(void);
  * @return RingbufHandle_t，唤醒词初始化前为 NULL
  */
 RingbufHandle_t wake_word_get_ringbuf(void);
-/* 单调采样位置只用于当前缓存生命周期；清空缓存时同步复位。所有访问均由
- * 缓存锁串行化，调用者不能持锁等待网络。speech_end 是 AFE 判为人声且能量
+/* FIFO 的逻辑采样位置只用于当前缓存生命周期；清空同步复位，唤醒时以判定
+ * 帧末端为起点。丢弃新帧不计入已入队长度。所有访问由缓存锁串行化，不能
+ * 持锁等待网络。首句闭合后单独保留最新 live PCM，读取切源时 read_end
+ * 跳过已淘汰的旧 live 帧；不会清空编码半包或有序 TX 队列。speech_end 是 AFE 判为人声且能量
  * 达到诊断门限的最后一帧末端，不表示识别出了完整语义。 */
 typedef struct {
     uint32_t written_end;
@@ -116,27 +134,37 @@ typedef struct {
 } wake_word_audio_progress_t;
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
 /** audio_in 唯一消费者：非阻塞复制一帧并归还项，返回字节数及末端采样位置。
+ * 首句结束且已读完时切到最新 live PCM，不等待网络或平台确认；调用者必须
+ * 先处理完上次返回的 PCM 再读下一帧，保留编码半包和 TX FIFO 的顺序。
  * 返回 0 表示无帧；返回值大于 capacity 时未复制，消费者必须报错。 */
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end);
+/** 唯一 TX 消费者在当前连接成功发送后确认采样末端；不持上传锁调用。
+ * 首句尚未闭合时，可在确实追到 512 ms 内提前恢复普通 FIFO；闭合后的
+ * 首句切源由唯一读取端完成，不依赖此确认，更不等待平台 ACK。
+ * 切换连接/清 FIFO 前必须等待编码和 TX 任务都退出，禁止确认旧连接采样。 */
+void wake_word_confirm_audio_sent(uint32_t sample_end);
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
 /* 主任务在上传已停止时切换。仅控制上传 FIFO，不停止 AFE/AEC 或共享 I2S 时钟。
  * 普通会话和提醒均保持 true；切换时清除旧采样进度。 */
 void wake_word_set_audio_buffer_enabled(bool enabled);
 
-/** 唤醒后的 pre-roll 采集：连接平台期间也把 AFE PCM 写入上传 FIFO。
- *  true 时 WS_CONNECTING_WAKE / WS_CONNECTED 也允许入队，且 AFE 模式切换
- *  不再整段清空 FIFO（避免丢掉唤醒词后紧跟的第一句话）。
- *  false = 旧行为（仅 LISTENING / PLAYING 入队，模式切换清空）。 */
+/** 取消预录音并清空 FIFO，必须在上传已停止时调用。
+ *  仅 false 有效；启用只能由 detect_Task 的真实 WakeNet 判定触发。 */
 void wake_word_set_pre_roll(bool enabled);
 
-/** 会话开始时裁掉指定采样位置之前的旧音频（唤醒词本身）。
- *  only drops frames fully below `sample_end`; the frame that straddles the
- *  boundary is retained so the first spoken word is not cut in half. */
-void wake_word_discard_audio_before(uint32_t sample_end);
+/** Select activation-ACK handoff for the current WakeNet recording only.
+ * Standby pre-authentication, touch and reminders do not start a recording. */
+void wake_word_select_hot_pre_roll(void);
+/** The same wake must open a fresh connection. Preserve the recorded prefix
+ * and resume the cold first-phrase policy. Only effective before upload. */
+void wake_word_fallback_cold_pre_roll(void);
 
-/** 下一次 AFE 模式切换完成时记录采样位置，供 start_audio_session 裁剪使用。 */
-void wake_word_mark_wake_boundary(void);
+/** 正式鉴权成功后、创建上传任务前调用。热连接冻结截至此刻的 PCM，
+ *  编码端读完即切实时；激活慢时允许冷连接的句尾保护。冷连接沿用
+ *  首句读完或追到 512 ms 内切实时。true 表示已接管此轮 WakeNet 预录音。
+ *  false 表示无有效预录音，主调继续旧清空行为。不会启停 AFE 或上传任务。 */
+bool wake_word_prepare_pre_roll_upload(void);
 
 /**
  * @brief 获取 AFE fetch 帧大小（samples）

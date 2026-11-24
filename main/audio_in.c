@@ -28,10 +28,22 @@
 #include <stdatomic.h>
 
 static const char *TAG = "audio_in";
-/* 编码放到 core 0，优先级低于 AFE feed(5)；core 1 留给解码和 PCM 输出。
- * 不改变 AFE/Wi-Fi/lwIP 的绑定，避免全双工时编码、解码串在同一核心。 */
+/* 编码 core 0/prio 4 低于 AFE feed(5)；发送 core 1/prio 4 低于解码(5)
+ * 和 PCM(6)。等待 WS 时编码可继续，短队列满则反压，不丢首句。 */
 #define AUDIO_UPLOAD_CORE 0
 #define AUDIO_UPLOAD_PRIORITY 4
+#define AUDIO_TX_CORE 1
+#define AUDIO_TX_PRIORITY 4
+#define AUDIO_TX_QUEUE_PACKETS 4u /* 含正在发送的包，最多 80 ms */
+#define AUDIO_UPLOAD_WAIT_MS 10u
+#define AUDIO_TX_QUEUE_TIMEOUT_US 2000000LL
+
+typedef struct {
+    uint8_t data[WS_OPUS_FRAME_MAX_BYTES];
+    size_t length;
+    uint32_t sample_end;
+    uint32_t connection_generation;
+} audio_tx_packet_t;
 
 /** 全局句柄（供 app_state.c 启动时使用） */
 static audio_in_handle_t s_audio_handle = NULL;
@@ -72,14 +84,23 @@ struct audio_in_impl {
     uint64_t                 encode_work_us, send_work_us; /* 含调度等待的累计墙钟时间 */
     uint32_t                 sent_end; /* h->lock 保护，成功发送后才推进 */
 
+    /* 单生产者/单消费者固定槽；发送返回前 head 不出队，锁外借用仍有效。
+     * PSRAM 在启动分配，仅两任务都退出后释放。head/count 由 lock 保护。 */
+    audio_tx_packet_t       *tx_packets;
+    unsigned                tx_head, tx_count;
+
     /* 任务 */
     TaskHandle_t             task_h;
+    TaskHandle_t             tx_task_h;
     SemaphoreHandle_t        done_sem;
+    SemaphoreHandle_t        tx_done_sem;
     SemaphoreHandle_t        paused_sem;
     atomic_bool              running;
     atomic_bool              paused;
+    atomic_bool              tasks_ready;
     atomic_uint              pause_epoch;
     atomic_uint              pause_ack_epoch;
+    atomic_uint              tx_pause_ack_epoch;
     uint32_t                 connection_generation;
 
     /* 回调 */
@@ -204,27 +225,50 @@ static void process_vad_frame(audio_in_handle_t h, const int16_t *pcm,
 
 static void fail_audio_upload(audio_in_handle_t h, esp_err_t err)
 {
-    if (!h->running) return;
+    /* 编码与 TX 可同时失败，一次运行最多发布一次恢复事件。 */
+    if (!atomic_exchange(&h->running, false)) return;
     ESP_LOGW(TAG, "Audio upload failed: %s; requesting recovery", esp_err_to_name(err));
-    h->running = false;
     event_bus_publish(EV_AUDIO_UPLOAD_FAILED, (void *)(uintptr_t)h->connection_generation, 0);
 }
 
-/* 暂停在拷贝下一批采样或发送前确认，保留半包。不得在持缓存锁/播放锁时等待。 */
-static bool wait_upload_enabled(audio_in_handle_t h)
+/* 每个任务在自己的安全边界确认同一暂停代次；不持锁等待。 */
+static bool wait_upload_enabled(audio_in_handle_t h, bool tx)
 {
-    while (h->running && atomic_load(&h->paused)) {
-        /* 连续暂停可能在任务尚未离开旧暂停循环前再次请求；每次请求都单独
-         * 确认，不能消费上一次信号后误认为本次网络发送已经结束。 */
-        atomic_store(&h->pause_ack_epoch, atomic_load(&h->pause_epoch));
-        xSemaphoreGive(h->paused_sem);
-        vTaskDelay(pdMS_TO_TICKS(10));
+    while (h->running && (!atomic_load(&h->tasks_ready) || atomic_load(&h->paused))) {
+        if (atomic_load(&h->paused)) {
+            atomic_store(tx ? &h->tx_pause_ack_epoch : &h->pause_ack_epoch,
+                         atomic_load(&h->pause_epoch));
+            xSemaphoreGive(h->paused_sem);
+        }
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_UPLOAD_WAIT_MS));
     }
     return h->running;
 }
 
-static void encode_and_send(audio_in_handle_t h, const int16_t *pcm, size_t pcm_samples,
-                            uint32_t sample_start)
+/* 只返回单个生产者可写的空槽，消费者不会访问尚未发布的 tail。
+ * 队列满最多等待 2 秒活跃时间；暂停不计入拥塞，10 ms 检查停止/暂停。 */
+static audio_tx_packet_t *wait_tx_slot(audio_in_handle_t h)
+{
+    int64_t waited_us = 0;
+    while (wait_upload_enabled(h, false)) {
+        xSemaphoreTake(h->lock, portMAX_DELAY);
+        audio_tx_packet_t *slot = h->tx_count < AUDIO_TX_QUEUE_PACKETS ?
+            &h->tx_packets[(h->tx_head + h->tx_count) % AUDIO_TX_QUEUE_PACKETS] : NULL;
+        xSemaphoreGive(h->lock);
+        if (slot) return slot;
+        if (waited_us >= AUDIO_TX_QUEUE_TIMEOUT_US) {
+            fail_audio_upload(h, ESP_ERR_TIMEOUT);
+            return NULL;
+        }
+        int64_t at = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_UPLOAD_WAIT_MS));
+        waited_us += esp_timer_get_time() - at;
+    }
+    return NULL;
+}
+
+static void encode_and_queue(audio_in_handle_t h, const int16_t *pcm, size_t pcm_samples,
+                             uint32_t sample_start)
 {
     if (h->opus_enc == NULL) {
         opus_enc_config_t cfg = {
@@ -236,73 +280,120 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm, size_t pcm_
         };
         h->opus_enc = opus_enc_create(&cfg);
         if (h->opus_enc == NULL) {
-            ESP_LOGW(TAG, "opus encoder create failed");
             fail_audio_upload(h, ESP_ERR_NO_MEM);
             return;
         }
     }
 
-    /* 按帧拼接，避免对每个采样执行原子查询。32 ms AFE 帧可能产生两包
-     * 20 ms Opus，剩余采样留给下一次读取；不补静音、不重复发送。 */
-    uint8_t opus_out[WS_OPUS_FRAME_MAX_BYTES];
+    /* 32 ms AFE 帧跨越 20 ms Opus 边界时保留半包，不补静音/重复采样。 */
     size_t consumed = 0;
     while (consumed < pcm_samples && h->running) {
-        if (!wait_upload_enabled(h)) break;
+        if (!wait_upload_enabled(h, false)) break;
         size_t count = 320 - h->opus_samples;
         if (count > pcm_samples - consumed) count = pcm_samples - consumed;
         memcpy(h->opus_pcm + h->opus_samples, pcm + consumed, count * sizeof(int16_t));
         h->opus_samples += count;
         consumed += count;
         if (h->opus_samples == 320) {
+            audio_tx_packet_t *packet = wait_tx_slot(h);
+            if (!packet) break;
             int64_t encode_at = esp_timer_get_time();
-            int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm), opus_out, sizeof(opus_out));
+            int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm),
+                                          packet->data, sizeof(packet->data));
             uint32_t encode_us = (uint32_t)(esp_timer_get_time() - encode_at);
+            xSemaphoreTake(h->lock, portMAX_DELAY);
             h->encode_work_us += encode_us;
             if (encode_us > h->encode_max_us) h->encode_max_us = encode_us;
-            if (opus_len > 0) {
-                if (!wait_upload_enabled(h)) break;
-                /* AFE 已按真实时间产出 PCM。取消第二套发送时钟，网络短暂阻塞
-                 * 后及时消费有界 FIFO，避免额外等待把延迟累积成录音丢帧。 */
-                int64_t sent_at = esp_timer_get_time();
-                esp_err_t err = ws_service_send_opus_frame(opus_out, opus_len);
-                uint32_t send_us = (uint32_t)(esp_timer_get_time() - sent_at);
-                h->send_work_us += send_us;
-                if (send_us > h->send_max_us) h->send_max_us = send_us;
-                if (err == ESP_OK) {
-                    ++h->stats_packets;
-                    xSemaphoreTake(h->lock, portMAX_DELAY);
-                    h->sent_end = sample_start + consumed;
-                    xSemaphoreGive(h->lock);
-                }
-                else fail_audio_upload(h, err);
-            } else {
-                /* 编码失败交给主任务恢复，不能静默跳过一句话中的采样。 */
+            xSemaphoreGive(h->lock);
+            if (opus_len <= 0 || (size_t)opus_len > sizeof(packet->data)) {
                 ESP_LOGW(TAG, "Opus encode failed: %d", opus_len);
                 fail_audio_upload(h, ESP_FAIL);
+                break;
             }
+            packet->length = (size_t)opus_len;
+            packet->sample_end = sample_start + consumed;
+            packet->connection_generation = h->connection_generation;
+            /* 发布只持短锁；暂停发生在编码中时，完整包保留在队列中。 */
+            xSemaphoreTake(h->lock, portMAX_DELAY);
+            ++h->tx_count;
+            xSemaphoreGive(h->lock);
             h->opus_samples = 0;
         }
     }
 }
 
-/* 每 5 秒在上传任务中采样；耗时是包含抢占的墙钟时间，不是纯 CPU 时间。 */
+/* 发送一个已发布的包，唯一调用者为 TX task；返回 false 表示本次未发送成功。 */
+static bool transmit_next_packet(audio_in_handle_t h)
+{
+    if (!wait_upload_enabled(h, true)) return false;
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    audio_tx_packet_t *packet = h->tx_count ? &h->tx_packets[h->tx_head] : NULL;
+    xSemaphoreGive(h->lock);
+    if (!packet) return false;
+    if (packet->connection_generation != ws_service_generation()) {
+        fail_audio_upload(h, ESP_ERR_INVALID_STATE);
+        return false;
+    }
+    /* 连接生命周期必须先等两任务退出再重连；不在 h->lock 内等待网络。 */
+    int64_t sent_at = esp_timer_get_time();
+    esp_err_t err = ws_service_send_opus_frame(packet->data, packet->length);
+    uint32_t send_us = (uint32_t)(esp_timer_get_time() - sent_at);
+    uint32_t sample_end = packet->sample_end;
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    h->send_work_us += send_us;
+    if (send_us > h->send_max_us) h->send_max_us = send_us;
+    if (err == ESP_OK) {
+        ++h->stats_packets;
+        h->sent_end = sample_end;
+        h->tx_head = (h->tx_head + 1) % AUDIO_TX_QUEUE_PACKETS;
+        --h->tx_count;
+    }
+    xSemaphoreGive(h->lock);
+    if (err == ESP_OK) wake_word_confirm_audio_sent(sample_end);
+    else fail_audio_upload(h, err);
+    return err == ESP_OK;
+}
+
+/* 每 5 秒输出一次；所有共享计数在同一短锁中拍快照并清零。
+ * 耗时含调度等待；tx_queue_ms 含正在发送的包，pending_ms 含 FIFO/半包/队列。 */
 static void log_upload_stats(audio_in_handle_t h)
 {
     int64_t now = esp_timer_get_time();
+    /* stats_at 仅编码任务写，启动时尚无任务读取。 */
     if (now - h->stats_at < 5000000) return;
     wake_word_audio_progress_t progress;
     wake_word_get_audio_progress(&progress);
-    ESP_LOGI(TAG, "Upload stats: window_ms=%lu packets=%lu audio_ms=%lu fifo_ms=%lu "
-             "encode_max_us=%lu send_max_us=%lu encode_work_ms=%lu send_work_ms=%lu",
-             (unsigned long)((now - h->stats_at) / 1000), (unsigned long)h->stats_packets,
-             (unsigned long)(h->stats_packets * 20),
-             (unsigned long)((uint32_t)(progress.written_end - progress.read_end) / 16),
-             (unsigned long)h->encode_max_us, (unsigned long)h->send_max_us,
-             (unsigned long)(h->encode_work_us / 1000),
-             (unsigned long)(h->send_work_us / 1000));
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    int64_t window_us = now - h->stats_at;
+    uint32_t packets = h->stats_packets, encode_max = h->encode_max_us, send_max = h->send_max_us;
+    uint64_t encode_work = h->encode_work_us, send_work = h->send_work_us;
+    uint32_t tx_queue_ms = h->tx_count * 20;
+    int32_t pending = (int32_t)(progress.written_end - h->sent_end);
     h->stats_at = now;
     h->stats_packets = h->encode_max_us = h->send_max_us = 0;
     h->encode_work_us = h->send_work_us = 0;
+    xSemaphoreGive(h->lock);
+    ESP_LOGI(TAG, "Upload stats: window_ms=%lu packets=%lu audio_ms=%lu fifo_ms=%lu "
+             "tx_queue_ms=%lu pending_ms=%lu encode_max_us=%lu send_max_us=%lu "
+             "encode_work_ms=%lu send_work_ms=%lu",
+             (unsigned long)(window_us / 1000), (unsigned long)packets,
+             (unsigned long)(packets * 20),
+             (unsigned long)((uint32_t)(progress.written_end - progress.read_end) / 16),
+             (unsigned long)tx_queue_ms, (unsigned long)(pending > 0 ? pending / 16 : 0),
+             (unsigned long)encode_max, (unsigned long)send_max,
+             (unsigned long)(encode_work / 1000), (unsigned long)(send_work / 1000));
+}
+
+static void audio_tx_task(void *param)
+{
+    audio_in_handle_t h = param;
+    while (h->running) {
+        bool sent = transmit_next_packet(h);
+        if (h->running)
+            vTaskDelay(sent ? 1 : pdMS_TO_TICKS(AUDIO_UPLOAD_WAIT_MS));
+    }
+    xSemaphoreGive(h->tx_done_sem);
+    vTaskDelete(NULL);
 }
 
 /* ===========================================================================
@@ -327,7 +418,7 @@ static void audio_in_task(void *param)
              wake_word_get_chunksize(), xPortGetCoreID());
 
     while (h->running) {
-        if (!wait_upload_enabled(h)) break;
+        if (!wait_upload_enabled(h, false)) break;
         uint32_t sample_end = 0;
         /* 与生产者共用短缓存锁，复制/归还和采样位置一起推进；网络发送在锁外。 */
         size_t item_size_out = wake_word_read_audio(frame_buf, item_size, &sample_end);
@@ -348,8 +439,8 @@ static void audio_in_task(void *param)
             h->pcm_cb(h->pcm_cb_arg, frame_buf, item_size_out, ts);
         }
 
-        /* Opus 编码 + WS 发送（实时） */
-        encode_and_send(h, frame_buf, samples_read, sample_end - samples_read);
+        /* 编码后交给固定短队列；TX 在另一个核心等待网络。 */
+        encode_and_queue(h, frame_buf, samples_read, sample_end - samples_read);
 
         /* VAD */
         if (h->running) process_vad_frame(h, frame_buf, samples_read, ts);
@@ -402,9 +493,11 @@ audio_in_handle_t audio_in_create(const audio_in_config_t *cfg)
     }
 
     h->done_sem = xSemaphoreCreateBinary();
+    h->tx_done_sem = xSemaphoreCreateBinary();
     h->paused_sem = xSemaphoreCreateBinary();
-    if (h->done_sem == NULL || h->paused_sem == NULL) {
+    if (h->done_sem == NULL || h->tx_done_sem == NULL || h->paused_sem == NULL) {
         if (h->done_sem) vSemaphoreDelete(h->done_sem);
+        if (h->tx_done_sem) vSemaphoreDelete(h->tx_done_sem);
         if (h->paused_sem) vSemaphoreDelete(h->paused_sem);
         vSemaphoreDelete(h->lock);
         free(h->vad_buf);
@@ -431,6 +524,7 @@ void audio_in_destroy(audio_in_handle_t h)
 
     free(h->vad_buf);
     vSemaphoreDelete(h->done_sem);
+    vSemaphoreDelete(h->tx_done_sem);
     vSemaphoreDelete(h->paused_sem);
     vSemaphoreDelete(h->lock);
     if (s_audio_handle == h) s_audio_handle = NULL;
@@ -450,13 +544,18 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
         return ESP_OK;
     }
     if (ringbuf == NULL) return ESP_ERR_INVALID_ARG;
-    if (h->task_h) {
+    if (h->task_h || h->tx_task_h) {
         esp_err_t err = audio_in_stop(h);
         if (err != ESP_OK) return err;
     }
 
+    h->tx_packets = heap_caps_malloc(sizeof(*h->tx_packets) * AUDIO_TX_QUEUE_PACKETS,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!h->tx_packets) return ESP_ERR_NO_MEM;
+    h->tx_head = h->tx_count = 0;
     h->ringbuf = ringbuf;
     h->running = true;
+    atomic_store(&h->tasks_ready, false);
     h->connection_generation = ws_service_generation();
     h->opus_samples = 0;
     atomic_store(&h->paused, false);
@@ -464,12 +563,13 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     wake_word_get_audio_progress(&progress);
     xSemaphoreTake(h->lock, portMAX_DELAY);
     h->sent_end = progress.read_end;
-    xSemaphoreGive(h->lock);
     h->stats_at = esp_timer_get_time();
     h->stats_packets = h->encode_max_us = h->send_max_us = 0;
     h->encode_work_us = h->send_work_us = 0;
+    xSemaphoreGive(h->lock);
     /* 清除上一次任务的完成信号，再创建新任务。 */
     xSemaphoreTake(h->done_sem, 0);
+    xSemaphoreTake(h->tx_done_sem, 0);
 
     /* VAD 状态复位 */
     vad_reset(h);
@@ -477,16 +577,23 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
      * 失败只告警；结束/创建任务失败后恢复省电，监听与播放切换不反复切换。 */
     (void)wifi_service_set_audio_active(true);
 
+    /* 首个任务等 ready，第二个创建失败时不会取 PCM/发包；先回收再释放槽。 */
     BaseType_t ret = xTaskCreatePinnedToCore(
-        audio_in_task, "audio_in",
-        TASK_STACK_AUDIO_IN,
-        h, AUDIO_UPLOAD_PRIORITY, &h->task_h, AUDIO_UPLOAD_CORE);
+        audio_tx_task, "audio_tx", TASK_STACK_AUDIO_IN,
+        h, AUDIO_TX_PRIORITY, &h->tx_task_h, AUDIO_TX_CORE);
+    if (ret == pdPASS) {
+        ret = xTaskCreatePinnedToCore(
+            audio_in_task, "audio_in", TASK_STACK_AUDIO_IN,
+            h, AUDIO_UPLOAD_PRIORITY, &h->task_h, AUDIO_UPLOAD_CORE);
+    }
     if (ret != pdPASS) {
         h->running = false;
-        h->task_h = NULL;
-        (void)wifi_service_set_audio_active(false);
-        return ESP_ERR_NO_MEM;
+        esp_err_t stopped = audio_in_stop(h);
+        return stopped == ESP_OK ? ESP_ERR_NO_MEM : stopped;
     }
+    atomic_store(&h->tasks_ready, true);
+    ESP_LOGI(TAG, "Upload pipeline started: encode core=%d TX core=%d queue=%u ms",
+             AUDIO_UPLOAD_CORE, AUDIO_TX_CORE, (unsigned)(AUDIO_TX_QUEUE_PACKETS * 20));
     return ESP_OK;
 }
 
@@ -498,7 +605,8 @@ esp_err_t audio_in_pause(audio_in_handle_t h)
     unsigned epoch = atomic_fetch_add(&h->pause_epoch, 1) + 1;
     atomic_store(&h->paused, true);
     int64_t deadline = esp_timer_get_time() + 2000000;
-    while (h->running && atomic_load(&h->pause_ack_epoch) != epoch) {
+    while (h->running && (atomic_load(&h->pause_ack_epoch) != epoch ||
+                          atomic_load(&h->tx_pause_ack_epoch) != epoch)) {
         int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
         if (left_ms <= 0) return ESP_ERR_TIMEOUT;
         xSemaphoreTake(h->paused_sem, pdMS_TO_TICKS((uint32_t)left_ms));
@@ -525,6 +633,9 @@ void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *s
     status->running = h->running;
     xSemaphoreTake(h->lock, portMAX_DELAY);
     status->sent_end = h->sent_end;
+    status->tx_queue_ms = h->tx_count * 20;
+    int32_t pending = (int32_t)(progress.written_end - h->sent_end);
+    status->pending_ms = pending > 0 ? (uint32_t)pending / 16 : 0;
     xSemaphoreGive(h->lock);
 }
 
@@ -533,15 +644,30 @@ esp_err_t audio_in_stop(audio_in_handle_t h)
     if (h == NULL) return ESP_ERR_INVALID_ARG;
 
     h->running = false;
+    int64_t deadline = esp_timer_get_time() + 2000000;
     if (h->task_h) {
-        /* 暂停/空队列每 10 ms 检查退出；正在发送的包由 WS 的有界超时约束。 */
         if (xSemaphoreTake(h->done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "audio_in task did not exit within timeout");
-            /* The task still owns the encoder. Never free/reuse it early. */
             return ESP_ERR_TIMEOUT;
         }
         h->task_h = NULL;
     }
+    if (h->tx_task_h) {
+        int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
+        TickType_t wait = left_ms > 0 ? pdMS_TO_TICKS((uint32_t)left_ms) : 0;
+        if (xSemaphoreTake(h->tx_done_sem, wait) != pdTRUE) {
+            ESP_LOGW(TAG, "audio_tx task did not exit within timeout");
+            return ESP_ERR_TIMEOUT;
+        }
+        h->tx_task_h = NULL;
+    }
+    /* 任一任务超时都保留编码器、队列和性能模式，后续 stop 继续等待。 */
+    free(h->tx_packets);
+    h->tx_packets = NULL;
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    h->tx_head = h->tx_count = 0;
+    xSemaphoreGive(h->lock);
+    atomic_store(&h->tasks_ready, false);
 
     /* 停止 Opus 编码器 */
     if (h->opus_enc) {
@@ -572,7 +698,7 @@ esp_err_t audio_in_register_utterance_cb(audio_in_handle_t h,
 {
     if (h == NULL) return ESP_ERR_INVALID_ARG;
     /* 与 start/stop 一样由主任务串行调用，只在任务完全停止后调整所有权。 */
-    if (h->running || h->task_h) return ESP_ERR_INVALID_STATE;
+    if (h->running || h->task_h || h->tx_task_h) return ESP_ERR_INVALID_STATE;
     if (cb && !h->vad_buf) {
         size_t capacity = (size_t)h->cfg.sample_rate * 20 * sizeof(int16_t);
         h->vad_buf = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

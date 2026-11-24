@@ -4,7 +4,7 @@
 
 ## 当前规则
 
-- 用户或 MQTT 唤醒后建立 WebSocket，通过 `__proxy_connected__` 鉴权通知后连续上传 AEC 后的麦克风音频。
+- 设备待机可预先建立并轻量认证 WebSocket。用户或 MQTT 唤醒后优先复用它进行正式鉴权，也可直接建连。收到 `__proxy_connected__` 后连续上传 AEC 处理过的麦克风音频。见[待机预连接与首句上传](wake-first-phrase.md)。
 - 同一连接内 AI 回复、电话和提醒统一接收、解码、播放。16 kHz 单声道，上行 20 ms Opus Base64 JSON，下行一条 binary 消息一个完整 raw Opus 包，未改为 PCM/Ogg。
 - 音频收发不依赖 `speech_started` / `speech_stopped` / `response.audio.done` / `response.output_audio.done` / `response.done`。其中平台 `input_audio_buffer.speech_started/stopped` 只参与静默待机，不停止播放、不清缓存。
 - 不发送 `response.cancel` / `input_audio_buffer.commit` / `response.create`。平台决定停止生成/发送及提醒优先级；设备不按人声清缓存，平台停发后已有缓存自然播完。
@@ -43,7 +43,7 @@ PCM 预填 300 ms、容量 500 ms、DMA 约 60 ms；网络消息队列保留既�
 
 详见 [MQTT 接入](device-mqtt.md)：
 
-1. 待机收到任务：保存编号，唤醒、建连，沿用首帧 auth 的 `device_id/api_key/task_ids`。认证后即开始双向音频。
+1. 待机收到任务：保存编号并唤醒，在正式会话的 auth 中携带 `device_id/api_key/task_ids`。认证后即开始双向音频。
 2. 在线收到任务：平台直接推音频；设备不发送额外任务请求、不重复 auth、不重连。
 3. 提醒可被平台语音打断，之后保持同一连接继续对话。
 4. 设备仅维护待交接通知，不判断完整播报、不发送 `audio_received` 业务回执、不按已播历史去重；MQTT 协议 PUBACK 保留。

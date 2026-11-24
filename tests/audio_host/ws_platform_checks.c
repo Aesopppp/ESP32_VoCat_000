@@ -23,13 +23,19 @@ static uint8_t *frame;
 static size_t frame_size, received;
 static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
 static size_t reminder_task_count;
+static char auth_device_id[65];
+static bool standby_auth;
+static unsigned preconnect_until_ms, preconnect_refresh_ms, random_value;
+static bool auth_sent, terminal_notified;
 static SemaphoreHandle_t playback_lock=(void*)1;
 static QueueHandle_t rx_queue=(void*)2;
 /* 单线程替身验证所有快照读写走短临界区，不模拟跨核调度。 */
-static unsigned speech_lock, critical_depth;
+static unsigned speech_lock, control_lock, critical_depth;
+static bool bus_full, delay_control;
+static event_t pending_control;
 static ws_speech_status_t speech_status;
-#define portENTER_CRITICAL(lock) do { CHECK((lock)==&speech_lock && !critical_depth); ++critical_depth; } while(0)
-#define portEXIT_CRITICAL(lock) do { CHECK((lock)==&speech_lock && critical_depth==1); --critical_depth; } while(0)
+#define portENTER_CRITICAL(lock) do { CHECK(((lock)==&speech_lock || (lock)==&control_lock) && !critical_depth); ++critical_depth; } while(0)
+#define portEXIT_CRITICAL(lock) do { CHECK(((lock)==&speech_lock || (lock)==&control_lock) && critical_depth==1); --critical_depth; } while(0)
 typedef const char *esp_event_base_t;
 typedef struct {
     int op_code, payload_len, data_len, payload_offset;
@@ -39,9 +45,22 @@ enum { WEBSOCKET_EVENT_BEFORE_CONNECT, WEBSOCKET_EVENT_CONNECTED,
        WEBSOCKET_EVENT_DISCONNECTED, WEBSOCKET_EVENT_CLOSED,
        WEBSOCKET_EVENT_ERROR, WEBSOCKET_EVENT_DATA };
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while(0)
+BaseType_t event_bus_publish(event_type_t id,const void *tag,size_t len)
+{
+    CHECK((uint32_t)(uintptr_t)tag==generation && !len);
+    if (bus_full) return pdFALSE;
+    ++events[id]; return pdTRUE;
+}
+#define publish production_publish
+unsigned esp_log_timestamp(void) { return clock_ms; }
+#include "ws_control.inc"
+#undef publish
 static void publish(app_event_id_t id,uint32_t gen)
-{ CHECK(gen==generation); ++events[id]; }
-#define current(p) ((p)->generation==generation && (state==WS_STATE_CONNECTED || state==WS_STATE_AUTHING || state==WS_STATE_PRECONNECTED))
+{
+    production_publish(id,gen);
+    event_t ev;
+    if (!delay_control && ws_service_take_pending_event(&ev)) ++events[ev.type];
+}
 BaseType_t xSemaphoreTake(SemaphoreHandle_t s,TickType_t ticks) { (void)s; (void)ticks; return pdTRUE; }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return pdTRUE; }
 UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) { (void)q; return queued; }
@@ -57,7 +76,7 @@ static int audio_out_play_opus(const uint8_t *data,size_t len)
     if (inject_disconnect) { state=WS_STATE_DISCONNECTED; stop_flag=true; return -1; }
     ++decoded; return decoded_samples;
 }
-uint32_t esp_random(void) { return 1; }
+uint32_t esp_random(void) { return random_value; }
 int64_t esp_timer_get_time(void) { return (int64_t)clock_ms * 1000; }
 #include "ws_platform.inc"
 static rx_frame_t pending[64];
@@ -97,6 +116,8 @@ static void reset(void)
     CHECK(rx_bytes==0);
     state=WS_STATE_CONNECTED; stop_flag=client_started=inject_disconnect=queue_fail=false;
     played_frames=0; decoded_samples=960; clock_ms=1000; reminder_task_count=0;
+    auth_sent=true; standby_auth=terminal_notified=false; preconnect_until_ms=preconnect_refresh_ms=0;
+    random_value=1; auth_device_id[0]=0;
     reset_speech_status();
     memset(reminder_device_id,0,sizeof(reminder_device_id));
     memset(reminder_task_ids,0,sizeof(reminder_task_ids));
@@ -183,7 +204,7 @@ static void speech_checks(void)
     ws_service_get_speech_status(&status); CHECK(!status.speaking && status.stopped_ms==46000);
     rx_frame_t stale=packet(start,1); ++generation; handle_frame(&stale);
     ws_service_get_speech_status(&status); CHECK(!status.speaking);
-    CHECK(proto_parse_speech_event(start)==PROTO_EVT_SPEECH_STARTED);
+    CHECK(proto_parse_priority_event(start)==PROTO_EVT_SPEECH_STARTED);
     CHECK(!observe_speech_event(PROTO_EVT_SPEECH_STARTED,&stale)); /* 解析后发生断连，再核对代次。 */
     ws_service_get_speech_status(&status); CHECK(!status.speaking);
     control(start); stale=packet(stop,1); ++generation; handle_frame(&stale);
@@ -198,7 +219,7 @@ static void speech_checks(void)
     control("{\"type\":\"__proxy_connected__\"}"); control(start);
     clock_ms=0; control(stop); ws_service_get_speech_status(&status);
     CHECK(!status.speaking && status.stopped_ms==UINT32_MAX); /* 0 哨兵与时钟回绕。 */
-    control(start); on_ws(NULL,NULL,WEBSOCKET_EVENT_CONNECTED,&event);
+    control(start); state=WS_STATE_CONNECTING; on_ws(NULL,NULL,WEBSOCKET_EVENT_CONNECTED,&event);
     ws_service_get_speech_status(&status); CHECK(!status.speaking && !status.stopped_ms);
     control("{\"type\":\"__proxy_connected__\"}"); control(start);
     on_ws(NULL,NULL,WEBSOCKET_EVENT_ERROR,&event);
@@ -227,12 +248,13 @@ static void speech_fast_path_checks(void)
     feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
     feed(1,start,(int)strlen(start),0,(int)strlen(start));
     feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
-    ws_service_get_speech_status(&status); CHECK(!status.speaking && pending_count==3);
-    handle_frame(&pending[0]); /* auth 已处理，但 worker 还没处理旧讲话边界。 */
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && pending_count==0);
+    rx_frame_t delayed=packet(stop,1);
     feed(1,start,(int)strlen(start),0,(int)strlen(start));
-    ws_service_get_speech_status(&status); CHECK(status.speaking && pending_count==3);
+    handle_frame(&delayed);
+    ws_service_get_speech_status(&status); CHECK(status.speaking && pending_count==0);
     drain_queue(); ws_service_get_speech_status(&status);
-    CHECK(status.speaking && !status.stopped_ms && rx_bytes==0); /* 旧 stop 不覆盖新 start。 */
+    CHECK(status.speaking && status.stopped_ms==clock_ms && rx_bytes==0);
     reset(); state=WS_STATE_AUTHING;
     feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
     feed(1,start,(int)strlen(start),0,(int)strlen(start));
@@ -241,15 +263,15 @@ static void speech_fast_path_checks(void)
     reset(); state=WS_STATE_AUTHING;
     feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
     feed(1,start,(int)strlen(start),0,(int)strlen(start));
-    handle_frame(&pending[0]); clock_ms+=45000;
+    clock_ms+=45000;
     feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
     drain_queue(); ws_service_get_speech_status(&status);
     CHECK(!status.speaking && status.stopped_ms==clock_ms); /* start未出队，stop仍须续期。 */
-    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\",\"type\":\"x\"}")==PROTO_EVT_UNKNOWN);
-    CHECK(proto_parse_speech_event("{\"type\":\"conversation.item.input_audio_transcription.started\"}")==PROTO_EVT_UNKNOWN);
-    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\"} trailing")==PROTO_EVT_UNKNOWN);
-    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\\u0000bad\"}")==PROTO_EVT_UNKNOWN);
-    CHECK(proto_parse_speech_event(NULL)==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_priority_event("{\"type\":\"input_audio_buffer.speech_started\",\"type\":\"x\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_priority_event("{\"type\":\"conversation.item.input_audio_transcription.started\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_priority_event("{\"type\":\"input_audio_buffer.speech_started\"} trailing")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_priority_event("{\"type\":\"input_audio_buffer.speech_started\\u0000bad\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_priority_event(NULL)==PROTO_EVT_UNKNOWN);
     reset(); rx_packet_sequence=UINT32_MAX-1;
     feed(1,start,(int)strlen(start),0,(int)strlen(start));
     feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
@@ -272,15 +294,98 @@ static void reminder_checks(void)
     CHECK(decoded==2 && !stop_flag && state==WS_STATE_CONNECTED);
     CHECK(!events[EV_WS_RESPONSE_DONE] && !events[EV_WS_SERVER_ERROR]);
 }
+static void preconnect_checks(void)
+{
+    const char *ready="{\"type\":\"__preconnect_ready__\",\"expires_in\":600}";
+    const char *proxy="{\"type\":\"__proxy_connected__\",\"audio_format\":{\"encoding\":\"opus\",\"sample_rate\":16000,\"channels\":1}}";
+    const char *pcm="{\"type\":\"__proxy_connected__\",\"audio_format\":{\"encoding\":\"pcm16\",\"sample_rate\":16000,\"channels\":1}}";
+    const char *missing="{\"type\":\"__proxy_connected__\"}";
+    const char *closed="{\"type\":\"session.closed\",\"reason\":\"server_ended\"}";
+    esp_websocket_event_data_t event={0};
+    reset(); state=WS_STATE_CONNECTING; strcpy(auth_device_id,"dev-1"); standby_auth=true;
+    on_ws(NULL,NULL,WEBSOCKET_EVENT_CONNECTED,&event);
+    CHECK(state==WS_STATE_PREAUTHING && events[EV_WS_CONNECTED]==1);
+    auth_sent=false; control(ready); audio();
+    CHECK(state==WS_STATE_PREAUTHING && !decoded && !events[EV_WS_AUTH_OK]);
+    auth_sent=true; clock_ms=UINT32_MAX-100;
+    feed(1,ready,strlen(ready),0,strlen(ready)); audio(); control(ready);
+    CHECK(state==WS_STATE_PRECONNECTED && events[EV_WS_PRECONNECT_READY]==1 && !decoded);
+    clock_ms+=599999; CHECK(ws_service_preconnect_valid()); ++clock_ms;
+    CHECK(!ws_service_preconnect_valid());
+    CHECK(ws_service_prepare_reminder("dev-1",(const char *const[]){"1"},1)==ESP_ERR_INVALID_STATE);
+    --clock_ms;
+    CHECK(ws_service_prepare_reminder("dev-other",(const char *const[]){"1"},1)==ESP_ERR_INVALID_STATE);
+    CHECK(ws_service_prepare_reminder("dev-1",(const char *const[]){"13"},1)==ESP_OK);
+    state=WS_STATE_ACTIVATING; audio(); CHECK(!decoded);
+    feed(1,proxy,strlen(proxy),0,strlen(proxy)); audio(); control(proxy);
+    CHECK(decoded==1 && state==WS_STATE_CONNECTED && events[EV_WS_AUTH_OK]==1);
+    feed(1,closed,strlen(closed),0,strlen(closed));
+    on_ws(NULL,NULL,WEBSOCKET_EVENT_DISCONNECTED,&event);
+    CHECK(events[EV_WS_SESSION_CLOSED]==1 && !events[EV_WS_DISCONNECTED]);
+    reset(); state=WS_STATE_PREAUTHING;
+    feed(1,missing,strlen(missing),0,strlen(missing));
+    on_ws(NULL,NULL,WEBSOCKET_EVENT_DISCONNECTED,&event); audio();
+    CHECK(events[EV_WS_PRECONNECT_UNSUPPORTED]==1 && !events[EV_WS_AUTH_OK] && !events[EV_WS_DISCONNECTED] && !decoded);
+    reset(); state=WS_STATE_PREAUTHING; control("{\"type\":\"error\",\"error\":{\"code\":4002}}");
+    CHECK(events[EV_WS_PRECONNECT_REJECTED]==1 && !events[EV_WS_AUTH_FAILED]);
+    reset(); state=WS_STATE_PREAUTHING; control("{\"type\":\"error\",\"error\":{\"code\":\"token_expired\"}}");
+    CHECK(events[EV_WS_AUTH_FAILED]==1);
+    reset(); state=WS_STATE_PREAUTHING; control("{\"type\":\"__preconnect_ready__\",\"expires_in\":0.5}");
+    CHECK(events[EV_WS_PRECONNECT_REJECTED]==1 && !events[EV_WS_PRECONNECT_READY]);
+    reset(); state=WS_STATE_ACTIVATING; control(missing); CHECK(events[EV_WS_FORMAT_ERROR]==1);
+    reset(); state=WS_STATE_ACTIVATING; control(pcm); audio(); CHECK(events[EV_WS_FORMAT_ERROR]==1 && !decoded);
+    reset(); state=WS_STATE_AUTHING; control(pcm); audio(); CHECK(events[EV_WS_FORMAT_ERROR]==1 && !decoded);
+    reset(); state=WS_STATE_AUTHING; strcpy(auth_device_id,"dev-1"); control(missing);
+    CHECK(events[EV_WS_FORMAT_ERROR]==1 && !events[EV_WS_AUTH_OK]);
+}
+static void preconnect_refresh_checks(void)
+{
+    const uint32_t start = UINT32_MAX - 100u;
+    const uint32_t seeds[] = {0, 9999, UINT32_MAX};
+    uint32_t first_delay = 0;
+    bool staggered = false;
+    for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); ++i) {
+        reset();
+        clock_ms = start;
+        state = WS_STATE_PREAUTHING;
+        random_value = seeds[i];
+        control("{\"type\":\"__preconnect_ready__\",\"expires_in\":600}");
+        uint32_t delay = preconnect_refresh_ms - start;
+        CHECK(delay >= 500000 && delay <= 540000);
+        if (i == 0) first_delay = delay;
+        else if (delay != first_delay) staggered = true;
+        clock_ms = start + delay - 1;
+        CHECK(!ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+        ++clock_ms;
+        CHECK(ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+        clock_ms = start + 599999;
+        CHECK(ws_service_preconnect_valid());
+        ++clock_ms;
+        CHECK(!ws_service_preconnect_valid());
+        state = WS_STATE_ACTIVATING;
+        CHECK(!ws_service_preconnect_refresh_due());
+    }
+    CHECK(staggered);
+
+    reset();
+    state = WS_STATE_PREAUTHING;
+    uint32_t received_at = clock_ms;
+    control("{\"type\":\"__preconnect_ready__\",\"expires_in\":1}");
+    CHECK(!ws_service_preconnect_refresh_due());
+    uint32_t short_delay = preconnect_refresh_ms - received_at;
+    CHECK(short_delay > 0 && short_delay < 1000);
+    clock_ms += short_delay;
+    CHECK(ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+}
 static void framing_checks(void)
 {
     reset(); state=WS_STATE_AUTHING;
     const char *auth="{\"type\":\"__proxy_connected__\"}";
     feed(2,"early",5,0,5); feed(1,auth,(int)strlen(auth),0,5);
-    CHECK(pending_count==1 && frame && received==5);
+    CHECK(pending_count==0 && frame && received==5);
     feed(1,auth+5,(int)strlen(auth),5,(int)strlen(auth)-5);
     feed(2,"op",4,0,2); feed(2,"us",4,2,2);
-    CHECK(pending_count==3); drain_queue();
+    CHECK(pending_count==1); drain_queue();
     CHECK(events[EV_WS_AUTH_OK]==1 && decoded==1 && rx_bytes==0);
     feed(2,"first",5,0,2); feed(2,"new",3,0,3); drain_queue();
     CHECK(decoded==2 && rx_bytes==0);
@@ -307,6 +412,20 @@ static void framing_checks(void)
 int main(void)
 {
     continuous_checks(); session_checks(); speech_checks(); speech_fast_path_checks();
-    reminder_checks(); framing_checks(); reset();
+    reminder_checks(); preconnect_checks(); preconnect_refresh_checks(); framing_checks(); reset();
+    event_t ev;
+    bus_full=delay_control=true;
+    publish(EV_WS_CONNECTED,generation);
+    CHECK(ws_service_take_pending_event(&ev) && ev.type==EV_WS_CONNECTED);
+    publish(EV_WS_PRECONNECT_READY,generation); publish(EV_WS_DISCONNECTED,generation);
+    CHECK(ws_service_take_pending_event(&ev) && ev.type==EV_WS_DISCONNECTED);
+    publish(EV_WS_AUTH_OK,generation);
+    const char closed[]="{\"type\":\"session.closed\"}";
+    feed(1,closed,sizeof(closed)-1,0,sizeof(closed)-1);
+    publish(EV_WS_ERROR,generation);
+    CHECK(ws_service_take_pending_event(&ev) && ev.type==EV_WS_SESSION_CLOSED);
+    CHECK(!ws_service_take_pending_event(&ev));
+    publish(EV_WS_CONNECTED,generation); ++generation;
+    CHECK(!ws_service_take_pending_event(&ev));
     printf("PASS: %u production WS continuous-duplex checks\n",checks); return 0;
 }

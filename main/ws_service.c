@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
 #include <stdlib.h>
@@ -24,10 +25,15 @@ static esp_websocket_client_handle_t client;
 static atomic_int state = WS_STATE_DISCONNECTED;
 static atomic_uint generation = 1;
 static bool client_started;
-static bool preconnect_auth_sent;
-static uint32_t preconnect_expires_in;
 static proto_ws_credentials_t *credentials; /* 主任务设置；RX 仅在 playback_lock 下读取。 */
 static bool credentials_from_handshake;
+static char auth_device_id[65];  /* 先配置，再启动 transport；stop 后清除。 */
+static bool standby_auth;
+static atomic_uint preconnect_until_ms;
+static atomic_uint preconnect_refresh_ms;
+static atomic_bool auth_sent, terminal_notified;
+static portMUX_TYPE control_lock = portMUX_INITIALIZER_UNLOCKED;
+static event_t pending_control;
 static uint8_t *frame;
 static size_t frame_size, received;
 static int opcode;
@@ -72,15 +78,40 @@ static void observe_rx_packet(rx_frame_t *packet)
 
 static void publish(app_event_id_t id, uint32_t gen)
 {
-    /* Integer generation tag, not a borrowed pointer. */
-    if (gen == atomic_load(&generation))
-        event_bus_publish(id, (void *)(uintptr_t)gen, 0);
+    if (gen != atomic_load(&generation)) return;
+    /* A definitive gateway decision outranks an upload failure racing the
+     * close. Other lifecycle events normally follow the shared event bus. */
+    bool definitive = id == EV_WS_SESSION_CLOSED || id == EV_WS_PRECONNECT_UNSUPPORTED ||
+                      id == EV_WS_AUTH_FAILED || id == EV_WS_FORMAT_ERROR;
+    if (!definitive && event_bus_publish(id, (void *)(uintptr_t)gen, 0) == pdTRUE) return;
+    uint32_t published_ms = esp_log_timestamp();
+    portENTER_CRITICAL(&control_lock);
+    if (gen == atomic_load(&generation) && (definitive || !pending_control.type ||
+        (uint32_t)(uintptr_t)pending_control.payload != gen ||
+        pending_control.type == EV_WS_CONNECTED || pending_control.type == EV_WS_PRECONNECT_READY ||
+        pending_control.type == EV_WS_AUTH_OK)) {
+        pending_control = (event_t){ .type = id, .payload = (void *)(uintptr_t)gen,
+                                     .timestamp_ms = published_ms };
+    }
+    portEXIT_CRITICAL(&control_lock);
+}
+bool ws_service_take_pending_event(event_t *event)
+{
+    portENTER_CRITICAL(&control_lock);
+    bool available = pending_control.type != 0 &&
+                     (uint32_t)(uintptr_t)pending_control.payload == atomic_load(&generation);
+    if (available) *event = pending_control;
+    pending_control.type = 0;
+    portEXIT_CRITICAL(&control_lock);
+    return available;
 }
 uint32_t ws_service_generation(void) { return atomic_load(&generation); }
 static bool current(const rx_frame_t *packet)
 {
-    return packet->generation == atomic_load(&generation) &&
-           (state == WS_STATE_CONNECTED || state == WS_STATE_AUTHING);
+    ws_conn_state_t phase = atomic_load(&state);
+    return packet->generation == atomic_load(&generation) && (phase == WS_STATE_CONNECTED ||
+        phase == WS_STATE_AUTHING || phase == WS_STATE_PREAUTHING ||
+        phase == WS_STATE_PRECONNECTED || phase == WS_STATE_ACTIVATING);
 }
 
 static void reset_speech_status(void)
@@ -244,8 +275,6 @@ static void enqueue_rx_frame(rx_frame_t *packet)
 static void handle_frame(const rx_frame_t *packet)
 {
     if (!current(packet)) return;
-    uint32_t queue_ms = (uint32_t)(esp_timer_get_time() / 1000) - packet->received_ms;
-    if (queue_ms > queue_wait_max_ms) queue_wait_max_ms = queue_ms;
     xSemaphoreTake(playback_lock, portMAX_DELAY);
     if (!current(packet)) { xSemaphoreGive(playback_lock); return; }
     if (packet->opcode == 2) {
@@ -269,32 +298,60 @@ static void handle_frame(const rx_frame_t *packet)
     if (result != PROTO_OK) {
         if (result != PROTO_ERR_UNKNOWN_TYPE) {
             ESP_LOGW(TAG, "Invalid control frame: parse=%d bytes=%u", result, (unsigned)packet->len);
-            if (state == WS_STATE_AUTHING) {
+            if (state == WS_STATE_AUTHING || state == WS_STATE_PREAUTHING ||
+                state == WS_STATE_ACTIVATING) {
+                app_event_id_t id = state == WS_STATE_AUTHING ? EV_WS_AUTH_FAILED : EV_WS_PRECONNECT_REJECTED;
+                atomic_store(&terminal_notified, true);
                 state = WS_STATE_ERROR;
-                publish(EV_WS_AUTH_FAILED, packet->generation);
+                publish(id, packet->generation);
             }
         }
         xSemaphoreGive(playback_lock); return;
     }
-    if (msg.evt == PROTO_EVT_PROXY_CONNECTED && state == WS_STATE_AUTHING) {
-        state = WS_STATE_CONNECTED;
-        publish(EV_WS_AUTH_OK, packet->generation);
-    } else if (msg.evt == PROTO_EVT_PROXY_CONNECTED && state == WS_STATE_PRECONNECTED) {
-        state = WS_STATE_CONNECTED;
-        publish(EV_WS_AUTH_OK, packet->generation);
-    } else if (msg.evt == PROTO_EVT_PRECONNECT_READY &&
-               (state == WS_STATE_AUTHING || state == WS_STATE_PRECONNECTED) && preconnect_auth_sent) {
-        preconnect_auth_sent = false;
-        preconnect_expires_in = msg.preconnect_expires_in;
+    ws_conn_state_t phase = atomic_load(&state);
+    if (msg.evt == PROTO_EVT_SESSION_CLOSED) {
+        state = WS_STATE_DISCONNECTED;
+        if (!atomic_exchange(&terminal_notified, true)) publish(EV_WS_SESSION_CLOSED, packet->generation);
+    } else if (msg.evt == PROTO_EVT_PRECONNECT_READY && phase == WS_STATE_PREAUTHING && auth_sent) {
+        /* 低 32 位单调时钟，限制租期到有符号差值可比较的范围。 */
+        uint32_t ttl_ms = msg.expires_in > INT32_MAX / 1000u ? INT32_MAX : msg.expires_in * 1000u;
+        /* 每条待机连接随机错开刷新。600 秒租期在第 500～540 秒重建。 */
+        uint32_t earliest_ms = ttl_ms - ttl_ms / 6;
+        uint32_t latest_ms = ttl_ms - ttl_ms / 10;
+        uint32_t refresh_in_ms = earliest_ms + esp_random() % (latest_ms - earliest_ms + 1u);
+        atomic_store(&preconnect_until_ms, packet->received_ms + ttl_ms);
+        atomic_store(&preconnect_refresh_ms, packet->received_ms + refresh_in_ms);
         state = WS_STATE_PRECONNECTED;
+        ESP_LOGI(TAG, "Standby WebSocket ready: lease_s=%lu refresh_in_ms=%lu",
+                 (unsigned long)msg.expires_in, (unsigned long)refresh_in_ms);
         publish(EV_WS_PRECONNECT_READY, packet->generation);
+    } else if (msg.evt == PROTO_EVT_PROXY_CONNECTED &&
+               (phase == WS_STATE_PREAUTHING || phase == WS_STATE_PRECONNECTED)) {
+        /* 老网关忽略 preconnect，切勿让待机设备进通话。 */
+        atomic_store(&terminal_notified, true);
+        state = WS_STATE_ERROR;
+        publish(EV_WS_PRECONNECT_UNSUPPORTED, packet->generation);
+    } else if (msg.evt == PROTO_EVT_PROXY_CONNECTED &&
+               (phase == WS_STATE_AUTHING || phase == WS_STATE_ACTIVATING) && auth_sent) {
+        if ((msg.has_audio_format || auth_device_id[0] || phase == WS_STATE_ACTIVATING) && !msg.opus_16k_mono) {
+            ESP_LOGE(TAG, "Gateway audio format incompatible; expected Opus 16000 Hz mono");
+            atomic_store(&terminal_notified, true);
+            state = WS_STATE_ERROR;
+            publish(EV_WS_FORMAT_ERROR, packet->generation);
+        } else {
+            state = WS_STATE_CONNECTED;
+            publish(EV_WS_AUTH_OK, packet->generation);
+        }
     } else if (msg.evt == PROTO_EVT_ERROR) {
         log_server_error(&msg);
-        bool auth_failed = state == WS_STATE_AUTHING || preconnect_auth_sent ||
-                           proto_is_auth_error(&msg);
+        app_event_id_t id = EV_WS_SERVER_ERROR;
+        if (phase == WS_STATE_AUTHING || proto_is_auth_error(&msg)) id = EV_WS_AUTH_FAILED;
+        else if (phase == WS_STATE_PREAUTHING || phase == WS_STATE_PRECONNECTED ||
+                 phase == WS_STATE_ACTIVATING) id = EV_WS_PRECONNECT_REJECTED;
+        atomic_store(&terminal_notified, true);
         state = WS_STATE_ERROR;
         reset_speech_status();
-        publish(auth_failed ? EV_WS_AUTH_FAILED : EV_WS_SERVER_ERROR, packet->generation);
+        publish(id, packet->generation);
     }
     /* 只有认证尚未处理时的讲话通知才需经过 worker；禁止使用转录别名。 */
     if (strcmp(msg.raw_type, "input_audio_buffer.speech_started") == 0 ||
@@ -311,6 +368,8 @@ static void receive_task(void *arg)
     uint32_t stats_ms = 0, stats_packets = 0, stats_generation = 0;
     while (true) {
         if (xQueueReceive(rx_queue, &packet, pdMS_TO_TICKS(10)) == pdTRUE) {
+            uint32_t queue_ms = (uint32_t)(esp_timer_get_time() / 1000) - packet.received_ms;
+            if (queue_ms > queue_wait_max_ms) queue_wait_max_ms = queue_ms;
             handle_frame(&packet);
             release_rx_frame(packet.data, packet.len);
         }
@@ -338,25 +397,23 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         /* 已创建网络任务/transport，尚未分配本轮 TLS 握手内存。 */
         log_connection_memory("before-tls");
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
-        state = WS_STATE_AUTHING;
-        preconnect_auth_sent = false;
+        if (state != WS_STATE_CONNECTING) return;
+        state = standby_auth ? WS_STATE_PREAUTHING : WS_STATE_AUTHING;
         reset_speech_status();
         log_connection_memory("connected");
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
         state = WS_STATE_DISCONNECTED;
-        preconnect_auth_sent = false;
         reset_speech_status();
         log_transport_error("disconnected", event);
         release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
-        publish(EV_WS_DISCONNECTED, gen);
+        if (!atomic_exchange(&terminal_notified, true)) publish(EV_WS_DISCONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
         state = WS_STATE_ERROR;
-        preconnect_auth_sent = false;
         reset_speech_status();
         log_transport_error("error", event);
         log_connection_memory("transport-error");
-        publish(EV_WS_ERROR, gen);
+        if (!atomic_exchange(&terminal_notified, true)) publish(EV_WS_ERROR, gen);
     } else if (id == WEBSOCKET_EVENT_DATA) {
         esp_websocket_event_data_t *data = event;
         if (data->op_code != 1 && data->op_code != 2) return;
@@ -365,6 +422,7 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         if (data->payload_offset == 0) {
             release_rx_frame(frame, frame_size); frame = NULL; received = 0;
             frame_size = data->payload_len; opcode = data->op_code;
+            if (opcode == 2 && state != WS_STATE_CONNECTED) return;
             size_t used = atomic_load(&rx_bytes);
             if (opcode == 2 && !ws_rx_audio_fits(uxQueueMessagesWaiting(rx_queue),
                                                 used, frame_size + 1)) {
@@ -388,12 +446,22 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
             frame[received] = 0;
             rx_frame_t packet = {.data=frame, .len=received, .opcode=opcode, .generation=gen};
             observe_rx_packet(&packet);
-            /* 讲话边界不能被 PCM 背压/音频积压延迟。二进制热路径不解析 JSON。
-             * 认证前仍保留 FIFO 顺序；后续 worker 用序号防止旧事件反向覆盖。 */
-            bool speech_handled = packet.opcode == 1 && state == WS_STATE_CONNECTED &&
-                observe_speech_event(proto_parse_speech_event((char *)packet.data), &packet);
-            if (speech_handled) release_rx_frame(packet.data, packet.len);
-            else enqueue_rx_frame(&packet);
+            /* 认证回包、讲话边界和正常挂断按接收顺序处理；二进制热路径不解析 JSON。 */
+            if (packet.opcode == 1 && current(&packet) && state != WS_STATE_CONNECTED) {
+                /* 认证期间 worker 不播放音频。此处按线序处理，以保留 close 前的最终认证结果。 */
+                handle_frame(&packet);
+                release_rx_frame(packet.data, packet.len);
+            } else if (packet.opcode == 1 && state == WS_STATE_CONNECTED) {
+                proto_event_t priority = proto_parse_priority_event((char *)packet.data);
+                if (priority == PROTO_EVT_SESSION_CLOSED) {
+                    /* 先发布正常挂断，防止 TX 因状态门禁先报错、主任务先重连。 */
+                    if (!atomic_exchange(&terminal_notified, true)) publish(EV_WS_SESSION_CLOSED, gen);
+                    state = WS_STATE_DISCONNECTED;
+                    release_rx_frame(packet.data, packet.len);
+                } else if (observe_speech_event(priority, &packet)) release_rx_frame(packet.data, packet.len);
+                else enqueue_rx_frame(&packet);
+            } else if (packet.opcode == 2 && state == WS_STATE_CONNECTED) enqueue_rx_frame(&packet);
+            else release_rx_frame(packet.data, packet.len);
             frame = NULL; frame_size = received = 0;
         }
     }
@@ -511,9 +579,9 @@ esp_err_t ws_service_connect(void)
 {
     if (!client || !credentials) return ESP_ERR_INVALID_STATE;
     if (client_started) return ESP_OK;
+    atomic_store(&auth_sent, false);
+    atomic_store(&terminal_notified, false);
     state = WS_STATE_CONNECTING;
-    preconnect_auth_sent = false;
-    preconnect_expires_in = 0;
     reset_speech_status();
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
@@ -523,24 +591,70 @@ esp_err_t ws_service_connect(void)
     }
     return err;
 }
-esp_err_t ws_service_authenticate(void)
+esp_err_t ws_service_prepare_device_auth(const char *device_id)
 {
+    if (!device_id || !*device_id || strlen(device_id) >= sizeof(auth_device_id))
+        return ESP_ERR_INVALID_ARG;
+    if (!client || !credentials_from_handshake || !credentials || client_started ||
+        state != WS_STATE_DISCONNECTED || reminder_task_count) return ESP_ERR_INVALID_STATE;
+    strcpy(auth_device_id, device_id);
+    standby_auth = false;
+    return ESP_OK;
+}
+esp_err_t ws_service_prepare_preconnect(const char *device_id)
+{
+    esp_err_t err = ws_service_prepare_device_auth(device_id);
+    if (err == ESP_OK) standby_auth = true;
+    return err;
+}
+bool ws_service_preconnect_valid(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return state == WS_STATE_PRECONNECTED && (int32_t)(atomic_load(&preconnect_until_ms) - now) > 0;
+}
+bool ws_service_preconnect_refresh_due(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return state == WS_STATE_PRECONNECTED && (int32_t)(now - atomic_load(&preconnect_refresh_ms)) >= 0;
+}
+static esp_err_t send_auth(bool activating)
+{
+    ws_conn_state_t phase = atomic_load(&state);
+    bool preconnect = phase == WS_STATE_PREAUTHING;
     if (!client || !credentials ||
-        (state != WS_STATE_AUTHING && state != WS_STATE_PRECONNECTED)) return ESP_ERR_INVALID_STATE;
-    if (preconnect_auth_sent) return ESP_ERR_INVALID_STATE;
+        (activating ? !ws_service_preconnect_valid() : (phase != WS_STATE_AUTHING && !preconnect)))
+        return ESP_ERR_INVALID_STATE;
+    if (preconnect && auth_sent) return ESP_ERR_INVALID_STATE;
     const char *token = credentials->token;
     log_auth_token_fingerprint(token, credentials_from_handshake ?
                               "HTTP/handshake/websocket.token" : "NVS/korvo_cfg/acos_token");
-    size_t capacity = reminder_task_count ? PROTO_REMINDER_AUTH_FRAME_SIZE : strlen(token) * 6 + 32;
+    size_t capacity = strlen(token) * 6 + 192;
+    const char *device_id = auth_device_id[0] ? auth_device_id : reminder_device_id;
+    capacity += strlen(device_id) * 6;
+    for (size_t i = 0; i < reminder_task_count; ++i) capacity += strlen(reminder_task_ids[i]) + 4;
     char *auth = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!auth) return ESP_ERR_NO_MEM;
     const char *ids[PROTO_REMINDER_TASK_IDS_MAX];
     for (size_t i = 0; i < reminder_task_count; ++i) ids[i] = reminder_task_ids[i];
-    size_t len = reminder_task_count ?
-        proto_build_reminder_auth_frame(auth, capacity, token, reminder_device_id, ids, reminder_task_count) :
-        proto_build_auth_frame(auth, capacity, token);
-    esp_err_t err = len && esp_websocket_client_send_text(client, auth, len, pdMS_TO_TICKS(1000)) == (int)len
-                    ? ESP_OK : ESP_FAIL;
+    size_t len;
+    if (auth_device_id[0])
+        len = proto_build_d3_auth_frame(auth, capacity, token, device_id, preconnect, ids, reminder_task_count);
+    else if (reminder_task_count)
+        len = proto_build_reminder_auth_frame(auth, capacity, token, device_id, ids, reminder_task_count);
+    else len = proto_build_auth_frame(auth, capacity, token);
+    esp_err_t err = ESP_FAIL;
+    if (len) {
+        /* 在 send_text 前改变阶段，使同一 socket 上立即到达的 ACK 有确定归属。 */
+        int expected = WS_STATE_PRECONNECTED;
+        if (activating && (!ws_service_preconnect_valid() ||
+            !atomic_compare_exchange_strong(&state, &expected, WS_STATE_ACTIVATING)))
+            err = ESP_ERR_INVALID_STATE;
+        else {
+            atomic_store(&auth_sent, true);
+            if (esp_websocket_client_send_text(client, auth, len, pdMS_TO_TICKS(1000)) == (int)len)
+                err = ESP_OK;
+        }
+    }
     if (err == ESP_OK && reminder_task_count)
         ESP_LOGI(TAG, "Reminder auth sent: device_id=%s task_count=%u (token redacted)",
                  reminder_device_id, (unsigned)reminder_task_count);
@@ -549,45 +663,13 @@ esp_err_t ws_service_authenticate(void)
     free(auth);
     return err;
 }
-
-esp_err_t ws_service_preconnect(void)
-{
-    if (!client || !credentials || state != WS_STATE_AUTHING || reminder_task_count)
-        return ESP_ERR_INVALID_STATE;
-    if (preconnect_auth_sent) return ESP_ERR_INVALID_STATE;
-    const char *token = credentials->token;
-    log_auth_token_fingerprint(token, credentials_from_handshake ?
-                              "HTTP/handshake/websocket.token" : "NVS/korvo_cfg/acos_token");
-    size_t capacity = strlen(token) * 6 + 48;
-    char *auth = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!auth) return ESP_ERR_NO_MEM;
-    size_t len = proto_build_preconnect_auth_frame(auth, capacity, token);
-    esp_err_t err = len && esp_websocket_client_send_text(client, auth, len, pdMS_TO_TICKS(1000)) == (int)len
-                    ? ESP_OK : ESP_FAIL;
-    if (err == ESP_OK) preconnect_auth_sent = true;
-    volatile char *wipe = auth;
-    for (size_t i = 0; i < capacity; ++i) wipe[i] = 0;
-    free(auth);
-    return err;
-}
-
-esp_err_t ws_service_activate_preconnect(void)
-{
-    if (!client || !credentials || state != WS_STATE_PRECONNECTED) return ESP_ERR_INVALID_STATE;
-    preconnect_auth_sent = false;
-    preconnect_expires_in = 0;
-    return ws_service_authenticate();
-}
-
-uint32_t ws_service_get_preconnect_expires_in(void) { return preconnect_expires_in; }
-
+esp_err_t ws_service_authenticate(void) { return send_auth(false); }
+esp_err_t ws_service_activate_preconnection(void) { return send_auth(true); }
 esp_err_t ws_service_disconnect(void)
 {
     if (!client) return ESP_ERR_INVALID_STATE;
     bool was_started = client_started;
     state = WS_STATE_DISCONNECTED;
-    preconnect_auth_sent = false;
-    preconnect_expires_in = 0;
     reset_speech_status();
     /* 先解除 worker 的 PCM 背压，再等待 transport/播放器锁，避免关闭互等。 */
     audio_out_request_stop();
@@ -602,8 +684,11 @@ esp_err_t ws_service_disconnect(void)
     atomic_fetch_add(&generation, 1);
     xSemaphoreTake(playback_lock, portMAX_DELAY);
     state = WS_STATE_DISCONNECTED;
-    preconnect_auth_sent = false;
-    preconnect_expires_in = 0;
+    auth_device_id[0] = 0;
+    standby_auth = false;
+    atomic_store(&preconnect_until_ms, 0);
+    atomic_store(&preconnect_refresh_ms, 0);
+    atomic_store(&auth_sent, false);
     reminder_device_id[0] = 0;
     memset(reminder_task_ids, 0, sizeof(reminder_task_ids));
     reminder_task_count = 0;
@@ -676,7 +761,10 @@ esp_err_t ws_service_prepare_reminder(const char *device_id,
             if (*p < '0' || *p > '9') return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(playback_lock, portMAX_DELAY);
-    if (state != WS_STATE_DISCONNECTED || client_started || reminder_task_count) {
+    bool cold = state == WS_STATE_DISCONNECTED && !client_started && !standby_auth &&
+        (!auth_device_id[0] || !strcmp(device_id, auth_device_id));
+    bool warm = ws_service_preconnect_valid() && !strcmp(device_id, auth_device_id);
+    if ((!cold && !warm) || reminder_task_count) {
         xSemaphoreGive(playback_lock);
         return ESP_ERR_INVALID_STATE;
     }

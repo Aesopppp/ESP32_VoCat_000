@@ -30,7 +30,11 @@ typedef enum {
     EV_WS_SERVER_ERROR      = 7,
     EV_WS_RESPONSE_INTERRUPTED       = 8,
     EV_WS_AUTH_FAILED       = 9, /* 鉴权拒绝单独处理，避免用同一失效 key 无限重连。 */
-    EV_WS_PRECONNECT_READY  = 45, /* D3: 待机轻量鉴权完成，仅保活，不建会话。 */
+    EV_WS_PRECONNECT_READY  = 70,
+    EV_WS_PRECONNECT_REJECTED = 71,
+    EV_WS_PRECONNECT_UNSUPPORTED = 72,
+    EV_WS_FORMAT_ERROR      = 73,
+    EV_WS_SESSION_CLOSED    = 74,
     EV_WS_SPEECH_STARTED    = 40,
     EV_WS_SPEECH_STOPPED    = 41,
     EV_WS_RESPONSE_DONE     = 42,
@@ -80,7 +84,7 @@ typedef struct {
 
 /* Compatibility API used by service modules. */
 typedef app_event_id_t event_type_t;
-typedef struct {
+typedef struct event_bus_message {
     event_type_t type;
     void *payload;
     uint32_t timestamp_ms;
