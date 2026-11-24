@@ -251,9 +251,12 @@ static void retry_voice_connection(int64_t now)
         if (!waiting_for_credentials) {
             waiting_for_credentials = true;
             ESP_LOGI(TAG, "Waiting for valid HTTP handshake credentials before WebSocket");
+            latency_log_event("credentials-wait-start", (uint32_t)now_ms());
         }
         return; /* 只等待后台结果，不反复 stop，不占用音频/HTTP 工作任务。 */
     }
+    if (waiting_for_credentials)
+        latency_log_event("credentials-wait-end", (uint32_t)now_ms());
     waiting_for_credentials = false;
     ESP_LOGI(TAG, "Connecting WebSocket; credentials=%s",
              readiness == DEVICE_WS_READY ? "device handshake" : "legacy NVS (handshake disabled)");

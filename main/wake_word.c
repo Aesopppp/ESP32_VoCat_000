@@ -156,8 +156,8 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
          * 只跳过 live FIFO 已淘汰的旧帧，不丢首句，不等待 TX/平台确认。 */
         uint32_t replay_end = s_pre_roll_replay_end;
         uint32_t live_start = s_live_read_end;
-        replay_samples = replay_end > s_audio_progress.read_end ?
-                         replay_end - s_audio_progress.read_end : 0;
+        replay_samples = replay_end > s_wake_boundary_sample ?
+                         replay_end - s_wake_boundary_sample : 0;
         s_audio_progress.read_end = live_start;
         skipped_samples = live_start > replay_end ? live_start - replay_end : 0;
         live_samples = s_audio_progress.written_end - s_live_read_end;
@@ -193,23 +193,9 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
 void wake_word_confirm_audio_sent(uint32_t sample_end)
 {
     if (!s_audio_buffer_lock) return;
-    bool caught_up = false;
-    uint32_t pending_samples = 0, dropped = 0;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    /* 补传未封存时保留提前追近实时的路径；封存后由读取端切源。
-     * 生命周期切换仍须先停止两个上传任务再清 FIFO，禁止旧连接确认影响新连接。 */
-    pending_samples = s_audio_progress.written_end - sample_end;
-    if (s_pre_roll_enabled && s_pre_roll_uploading && !s_pre_roll_replay_sealed &&
-        pending_samples <= BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) {
-        s_pre_roll_enabled = s_pre_roll_uploading = false;
-        dropped = s_pre_roll_dropped_frames;
-        caught_up = true;
-    }
     xSemaphoreGive(s_audio_buffer_lock);
-    if (caught_up)
-        ESP_LOGI(TAG, "Pre-roll replay caught up; live FIFO restored (pending_ms=%lu dropped_new=%lu)",
-                 (unsigned long)(pending_samples / (BSP_I2S_SAMPLE_RATE / 1000u)),
-                 (unsigned long)dropped);
+    (void)sample_end;
 }
 
 /* WakeNet 判定帧本身不上传；其后 PCM 在建连/补传期间受保护。普通连续
@@ -755,6 +741,7 @@ bool wake_word_prepare_pre_roll_upload(void)
     if (prepared && !s_pre_roll_replay_sealed) {
         s_pre_roll_uploading = true;
         s_pre_roll_replay_end = s_audio_progress.written_end;
+        s_live_read_end = s_pre_roll_replay_end;
         s_pre_roll_replay_sealed = true;
         ESP_LOGI(TAG, "Pre-roll upload ready: boundary_sample=%lu buffered_ms=%lu dropped_ms=%lu",
                  (unsigned long)s_wake_boundary_sample,

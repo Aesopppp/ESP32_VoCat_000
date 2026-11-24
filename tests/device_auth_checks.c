@@ -134,6 +134,7 @@ static int fake_getaddrinfo(const char *node, const char *service, const void *h
                             host_addrinfo_t **res);
 static void fake_freeaddrinfo(host_addrinfo_t *res);
 #define latency_log_standby_event(...) ((void)0)
+#define latency_log_event(...) ((void)0)
 #define getaddrinfo fake_getaddrinfo
 #define freeaddrinfo fake_freeaddrinfo
 #include "ws_prepared.c.inc"
