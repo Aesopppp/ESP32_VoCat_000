@@ -146,8 +146,12 @@ static bool cleanup_pending;
 static int64_t cleanup_at_ms;
 static bool d3_preconnect_ready;
 static int64_t d3_preconnect_deadline_ms;
+static char d3_preconnect_url[PROTO_WS_URL_MAX + 1];
+static char d3_preconnect_token[PROTO_AUTH_TOKEN_MAX + 1];
+static bool d3_retry_pending;
 
-#define D3_PRECONNECT_REFRESH_MS (540LL * 1000LL)
+#define D3_PRECONNECT_DEFAULT_REFRESH_SEC 600u
+#define D3_PRECONNECT_REFRESH_FLOOR_SEC 60u
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -185,6 +189,9 @@ static void end_conversation(const char *reason)
     session_requested = conversation_active = false;
     d3_preconnect_ready = false;
     d3_preconnect_deadline_ms = 0;
+    d3_preconnect_url[0] = 0;
+    d3_preconnect_token[0] = 0;
+    d3_retry_pending = false;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
     retry_at_ms = auth_deadline_ms = resume_deadline_ms = 0;
     /* WS 关闭即平台挂断；不发送额外结束或 cancel 帧。 */
@@ -226,18 +233,64 @@ static void handle_voice_auth_failure(const char *reason)
 static void prepare_standby_websocket(void)
 {
     if (wifi_service_get_state() != WIFI_STATE_GOT_IP || provisioning_service_is_active() ||
-        session_requested || d3_preconnect_ready) return;
+        session_requested) return;
+    if (d3_retry_pending) {
+        if (!retry_at_ms || now_ms() < retry_at_ms) return;
+        d3_retry_pending = false;
+        retry_at_ms = 0;
+    }
     const device_handshake_response_t *configuration = NULL;
     if (device_handshake_service_prepare_websocket(&configuration) != DEVICE_WS_READY) return;
     if (!configuration) return;
+    if (d3_preconnect_ready && ws_service_get_state() == WS_STATE_PRECONNECTED) {
+        bool credentials_changed = !d3_preconnect_url[0] || !d3_preconnect_token[0] ||
+                                   strcmp(d3_preconnect_url, configuration->websocket.url) ||
+                                   strcmp(d3_preconnect_token, configuration->websocket.token);
+        if (!credentials_changed) return;
+        ESP_LOGI(TAG, "D3 preconnect credentials changed; rebuilding WebSocket");
+        d3_preconnect_ready = false;
+        d3_preconnect_deadline_ms = 0;
+        d3_retry_pending = false;
+        retry_at_ms = 0;
+        auth_deadline_ms = 0;
+        awaiting_voice_auth = false;
+        (void)ws_service_disconnect();
+        return;
+    }
     esp_err_t err = ws_service_set_credentials(configuration->websocket.url,
                                                configuration->websocket.token);
     if (err == ESP_OK) err = ws_service_connect();
     if (err == ESP_OK) {
+        snprintf(d3_preconnect_url, sizeof(d3_preconnect_url), "%s", configuration->websocket.url);
+        snprintf(d3_preconnect_token, sizeof(d3_preconnect_token), "%s", configuration->websocket.token);
         ESP_LOGI(TAG, "D3 standby WebSocket started; sending preconnect auth");
     } else {
         ESP_LOGW(TAG, "D3 standby WebSocket preparation failed: %s", esp_err_to_name(err));
     }
+}
+
+static void schedule_standby_preconnect_retry(const char *reason)
+{
+    if (session_requested || provisioning_service_is_active()) return;
+    d3_preconnect_ready = false;
+    d3_preconnect_deadline_ms = 0;
+    d3_preconnect_url[0] = 0;
+    d3_preconnect_token[0] = 0;
+    retry_at_ms = now_ms() + 5000;
+    d3_retry_pending = true;
+    auth_deadline_ms = 0;
+    awaiting_voice_auth = false;
+    ESP_LOGW(TAG, "D3 preconnect %s; retry scheduled", reason);
+}
+
+static int64_t d3_preconnect_refresh_delay_ms(void)
+{
+    uint32_t expires = ws_service_get_preconnect_expires_in();
+    if (!expires) expires = D3_PRECONNECT_DEFAULT_REFRESH_SEC;
+    uint32_t margin = expires / 10;
+    if (margin < D3_PRECONNECT_REFRESH_FLOOR_SEC) margin = D3_PRECONNECT_REFRESH_FLOOR_SEC;
+    if (margin >= expires) margin = expires / 2;
+    return (int64_t)(expires - margin) * 1000LL;
 }
 
 static void retry_voice_connection(int64_t now)
@@ -261,6 +314,9 @@ static void retry_voice_connection(int64_t now)
     if (ws_service_get_state() == WS_STATE_PRECONNECTED) {
         d3_preconnect_ready = false;
         d3_preconnect_deadline_ms = 0;
+        d3_retry_pending = false;
+        d3_preconnect_url[0] = 0;
+        d3_preconnect_token[0] = 0;
         ESP_LOGI(TAG, "Activating D3 preconnected WebSocket; credentials=%s",
                  readiness == DEVICE_WS_READY ? "device handshake" : "legacy NVS (handshake disabled)");
         if (reminder_task) {
@@ -360,10 +416,16 @@ static void start_conversation(const char *reason)
     if (ws_service_get_state() == WS_STATE_CONNECTED || ws_service_get_state() == WS_STATE_PRECONNECTED) {
         d3_preconnect_ready = false;
         d3_preconnect_deadline_ms = 0;
+        d3_retry_pending = false;
+        d3_preconnect_url[0] = 0;
+        d3_preconnect_token[0] = 0;
         start_audio_session(reason);
     } else {
         d3_preconnect_ready = false;
         d3_preconnect_deadline_ms = 0;
+        d3_retry_pending = false;
+        d3_preconnect_url[0] = 0;
+        d3_preconnect_token[0] = 0;
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         retry_at_ms = now_ms();
         led_set_connecting();
@@ -612,6 +674,9 @@ static void main_task(void *arg)
                 provisioning_service_confirm();
                 d3_preconnect_ready = false;
                 d3_preconnect_deadline_ms = 0;
+                d3_retry_pending = false;
+                d3_preconnect_url[0] = 0;
+                d3_preconnect_token[0] = 0;
                 device_handshake_service_renew_credentials();
                 prepare_standby_websocket();
                 /* D3 主链路：联网后立即建立 WSS 预连接；重复 IP 事件不能打断正在进行的对话。 */
@@ -690,10 +755,13 @@ static void main_task(void *arg)
                 break;
             case EV_WS_PRECONNECT_READY:
                 d3_preconnect_ready = true;
-                d3_preconnect_deadline_ms = now_ms() + D3_PRECONNECT_REFRESH_MS;
+                d3_retry_pending = false;
+                d3_preconnect_deadline_ms = now_ms() + d3_preconnect_refresh_delay_ms();
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
-                ESP_LOGI(TAG, "D3 WebSocket preconnected; waiting for wake");
+                ESP_LOGI(TAG, "D3 WebSocket preconnected; expires_in=%us refresh_in=%llds",
+                         (unsigned)ws_service_get_preconnect_expires_in(),
+                         (long long)((d3_preconnect_deadline_ms - now_ms()) / 1000));
                 break;
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
@@ -701,14 +769,22 @@ static void main_task(void *arg)
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
                 d3_preconnect_ready = false;
                 d3_preconnect_deadline_ms = 0;
+                d3_retry_pending = false;
+                d3_preconnect_url[0] = 0;
+                d3_preconnect_token[0] = 0;
                 start_audio_session(reminder_task ? "MQTT wake" : "wake/reconnect");
                 break;
             case EV_WS_DISCONNECTED:
                 d3_preconnect_ready = false;
                 d3_preconnect_deadline_ms = 0;
+                d3_retry_pending = false;
+                d3_preconnect_url[0] = 0;
+                d3_preconnect_token[0] = 0;
+                schedule_standby_preconnect_retry("transport disconnected");
                 recover_session("WebSocket transport disconnected");
                 break;
             case EV_WS_ERROR:
+                schedule_standby_preconnect_retry("transport error");
                 recover_session("WebSocket transport/receive failure");
                 break;
             case EV_WS_SERVER_ERROR:
@@ -717,6 +793,10 @@ static void main_task(void *arg)
             case EV_WS_AUTH_FAILED:
                 d3_preconnect_ready = false;
                 d3_preconnect_deadline_ms = 0;
+                d3_retry_pending = false;
+                d3_preconnect_url[0] = 0;
+                d3_preconnect_token[0] = 0;
+                schedule_standby_preconnect_retry("authentication rejected");
                 handle_voice_auth_failure("gateway authentication rejected");
                 break;
             case EV_AUDIO_UPLOAD_FAILED:
@@ -758,6 +838,9 @@ static void main_task(void *arg)
             now >= d3_preconnect_deadline_ms && !session_requested && !cleanup_pending) {
             d3_preconnect_ready = false;
             d3_preconnect_deadline_ms = 0;
+            d3_retry_pending = false;
+            d3_preconnect_url[0] = 0;
+            d3_preconnect_token[0] = 0;
             retry_at_ms = 0;
             auth_deadline_ms = 0;
             (void)ws_service_disconnect();
@@ -768,6 +851,9 @@ static void main_task(void *arg)
             else if (!d3_preconnect_ready && !session_requested) {
                 d3_preconnect_ready = false;
                 d3_preconnect_deadline_ms = 0;
+                d3_retry_pending = false;
+                d3_preconnect_url[0] = 0;
+                d3_preconnect_token[0] = 0;
                 retry_at_ms = now + 5000;
                 auth_deadline_ms = 0;
                 ESP_LOGW(TAG, "D3 preconnect timeout; retry scheduled");

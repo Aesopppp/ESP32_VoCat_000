@@ -161,6 +161,7 @@ static void builder_checks(void)
     cJSON_Delete(preconnect);
     CHECK(proto_parse_json("{\"type\":\"__preconnect_ready__\", \"expires_in\":600}", &msg) == PROTO_OK);
     CHECK(msg.evt == PROTO_EVT_PRECONNECT_READY);
+    CHECK(msg.preconnect_expires_in == 600);
     CHECK(!proto_build_auth_frame(NULL, sizeof(buffer), "test"));
     char reminder_buffer[PROTO_REMINDER_AUTH_FRAME_SIZE];
     const char *task_ids[] = { "42", "43" };
@@ -224,6 +225,7 @@ static void connection_checks(void)
     state = WS_STATE_PRECONNECTED;
     CHECK(ws_service_activate_preconnect() == ESP_OK);
     CHECK(state == WS_STATE_PRECONNECTED);
+    CHECK(ws_service_get_preconnect_expires_in() == 0);
     cJSON *activated = cJSON_Parse(sent); CHECK(activated != NULL);
     CHECK(!cJSON_GetObjectItemCaseSensitive(activated, "preconnect"));
     cJSON_Delete(activated);

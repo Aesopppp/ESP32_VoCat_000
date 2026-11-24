@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include "cJSON.h"
 
 #include "esp_random.h"
@@ -101,6 +102,10 @@ proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)
         msg->evt = PROTO_EVT_PROXY_CONNECTED;
     } else if (strcmp(type, "__preconnect_ready__") == 0) {
         msg->evt = PROTO_EVT_PRECONNECT_READY;
+        const cJSON *expires = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+        if (cJSON_IsNumber(expires) && expires->valueint > 0 &&
+            expires->valueint <= INT_MAX)
+            msg->preconnect_expires_in = (uint32_t)expires->valueint;
     } else if (strcmp(type, "input_audio_buffer.speech_started") == 0 ||
                strcmp(type, "conversation.item.input_audio_transcription.started") == 0) {
         msg->evt = PROTO_EVT_SPEECH_STARTED;

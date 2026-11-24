@@ -71,6 +71,7 @@ esp_err_t ws_service_authenticate(void);
 esp_err_t ws_service_preconnect(void);
 /** D3: activate the existing preconnected WS with a normal auth frame. */
 esp_err_t ws_service_activate_preconnect(void);
+uint32_t ws_service_get_preconnect_expires_in(void);
 uint32_t ws_service_generation(void);
 
 typedef struct {

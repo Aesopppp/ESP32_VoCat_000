@@ -64,6 +64,7 @@ typedef struct {
     proto_event_t  evt;             /* mapped event id                       */
     char           raw_type[80];
     int            raw_type_len;
+    uint32_t       preconnect_expires_in; /* __preconnect_ready__.expires_in, seconds */
 
     /* error frame */
     int            error_code;

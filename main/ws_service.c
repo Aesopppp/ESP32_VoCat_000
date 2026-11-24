@@ -25,6 +25,7 @@ static atomic_int state = WS_STATE_DISCONNECTED;
 static atomic_uint generation = 1;
 static bool client_started;
 static bool preconnect_auth_sent;
+static uint32_t preconnect_expires_in;
 static proto_ws_credentials_t *credentials; /* 主任务设置；RX 仅在 playback_lock 下读取。 */
 static bool credentials_from_handshake;
 static uint8_t *frame;
@@ -284,6 +285,7 @@ static void handle_frame(const rx_frame_t *packet)
     } else if (msg.evt == PROTO_EVT_PRECONNECT_READY &&
                (state == WS_STATE_AUTHING || state == WS_STATE_PRECONNECTED) && preconnect_auth_sent) {
         preconnect_auth_sent = false;
+        preconnect_expires_in = msg.preconnect_expires_in;
         state = WS_STATE_PRECONNECTED;
         publish(EV_WS_PRECONNECT_READY, packet->generation);
     } else if (msg.evt == PROTO_EVT_ERROR) {
@@ -511,6 +513,7 @@ esp_err_t ws_service_connect(void)
     if (client_started) return ESP_OK;
     state = WS_STATE_CONNECTING;
     preconnect_auth_sent = false;
+    preconnect_expires_in = 0;
     reset_speech_status();
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
@@ -572,8 +575,11 @@ esp_err_t ws_service_activate_preconnect(void)
 {
     if (!client || !credentials || state != WS_STATE_PRECONNECTED) return ESP_ERR_INVALID_STATE;
     preconnect_auth_sent = false;
+    preconnect_expires_in = 0;
     return ws_service_authenticate();
 }
+
+uint32_t ws_service_get_preconnect_expires_in(void) { return preconnect_expires_in; }
 
 esp_err_t ws_service_disconnect(void)
 {
@@ -581,6 +587,7 @@ esp_err_t ws_service_disconnect(void)
     bool was_started = client_started;
     state = WS_STATE_DISCONNECTED;
     preconnect_auth_sent = false;
+    preconnect_expires_in = 0;
     reset_speech_status();
     /* 先解除 worker 的 PCM 背压，再等待 transport/播放器锁，避免关闭互等。 */
     audio_out_request_stop();
@@ -596,6 +603,7 @@ esp_err_t ws_service_disconnect(void)
     xSemaphoreTake(playback_lock, portMAX_DELAY);
     state = WS_STATE_DISCONNECTED;
     preconnect_auth_sent = false;
+    preconnect_expires_in = 0;
     reminder_device_id[0] = 0;
     memset(reminder_task_ids, 0, sizeof(reminder_task_ids));
     reminder_task_count = 0;
