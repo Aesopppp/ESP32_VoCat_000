@@ -38,6 +38,9 @@ typedef enum {
     WS_STATE_AUTHING       = 2,  /* WS opened, auth sent, awaiting __proxy_connected__ */
     WS_STATE_CONNECTED     = 3,  /* auth ok, ready to send/receive audio */
     WS_STATE_ERROR         = 4,
+    WS_STATE_PREAUTHING,       /* 待机 auth(preconnect=true)，没有语音会话 */
+    WS_STATE_PRECONNECTED,     /* __preconnect_ready__，等待本地唤醒 */
+    WS_STATE_ACTIVATING,       /* 同一连接已发送普通 auth，等待 __proxy_connected__ */
 } ws_conn_state_t;
 
 /* ---- Public API -------------------------------------------------------- */
@@ -66,7 +69,16 @@ esp_err_t ws_service_deinit(void);
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
 /** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
 esp_err_t ws_service_authenticate(void);
+/* 主任务接口。新建待机连接前指定设备身份；预认证有效时只允许激活一次。 */
+esp_err_t ws_service_prepare_preconnect(const char *device_id);
+/* 冷连接发送带身份和 Opus 格式的普通 auth（无 preconnect 字段）。 */
+esp_err_t ws_service_prepare_device_auth(const char *device_id);
+bool ws_service_preconnect_valid(void);
+esp_err_t ws_service_activate_preconnection(void);
 uint32_t ws_service_generation(void);
+/* Main task: terminal results and lifecycle notices that did not fit on the bus. */
+struct event_bus_message;
+bool ws_service_take_pending_event(struct event_bus_message *event);
 
 typedef struct {
     bool speaking;       /* 已认证连接中的 speech_started，直到 speech_stopped。 */
@@ -80,7 +92,7 @@ typedef struct {
  * 供主任务待机判定，不控制麦克风、播放或音频接收窗口。 */
 void ws_service_get_speech_status(ws_speech_status_t *status);
 
-/** 主任务在断连时复制任务上下文，首条 auth 携带 task_ids。
+/** 主任务在断连或有效预连接时复制任务上下文，激活会话的 auth 携带 task_ids。
  * 仅影响鉴权字段；连接后的收发和普通会话一致，disconnect 清理上下文。 */
 esp_err_t ws_service_prepare_reminder(const char *device_id,
                                       const char *const *task_ids, size_t task_count);

@@ -32,6 +32,8 @@ device_ws_readiness_t device_handshake_service_prepare_websocket(
     const device_handshake_response_t **configuration);
 bool device_handshake_service_is_enabled(void);
 bool device_handshake_service_is_blocked(void);
+/* Main-task-only. Changes on network, identity or WebSocket token renewal. */
+unsigned device_handshake_service_websocket_epoch(void);
 /* 鉴权拒绝后由主任务有限次数调用；不重读身份、不解除 HTTP 永久错误。 */
 bool device_handshake_service_renew_credentials(void);
 

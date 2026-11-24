@@ -5,6 +5,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "../main/device_handshake_service.h"
+#include "../main/device_preconnect_config.h"
 #include "../main/device_handshake_http.h"
 #include "../main/ws_service.h"
 #include "../main/device_mqtt_service.h"
@@ -20,6 +21,7 @@
 #define DEVICE_HANDSHAKE_WS_REFRESH_MARGIN_SECONDS 300u
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) (*(p) = (v))
+#define atomic_compare_exchange_strong(p, e, v) ((*(p) == *(e)) ? (*(p) = (v), 1) : (*(e) = *(p), 0))
 #define pdMS_TO_TICKS(ms) (ms)
 #define pdTRUE 1
 
@@ -83,6 +85,10 @@ static proto_ws_credentials_t *credentials;
 static unsigned creates, stops, connects, recoveries, ends;
 static char sent[PROTO_REMINDER_AUTH_FRAME_SIZE], source_name[80], configured_url[PROTO_WS_URL_MAX + 1];
 static size_t reminder_task_count;
+static unsigned preconnect_until_ms;
+static bool auth_sent;
+static char auth_device_id[65];
+static bool standby_auth;
 static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
 static void *heap_caps_calloc(size_t count, size_t size, int caps)
 { (void)caps; return fail_alloc ? NULL : calloc(count, size); }
@@ -108,7 +114,7 @@ int esp_websocket_client_send_text(esp_websocket_client_handle_t handle, const c
 #include "ws_service.c.inc"
 
 static bool session_requested, voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
-static bool cleanup_pending;
+static bool cleanup_pending, preconnect_unsupported;
 static device_mqtt_delivery_t *reminder_task;
 esp_err_t ws_service_prepare_reminder(const char *device_id, const char *const *ids, size_t count)
 {
@@ -157,6 +163,7 @@ static void fresh(void)
     s_snapshot->network_epoch = s_network_epoch;
     s_snapshot->result.success = true; s_snapshot->result.status = 200;
     s_snapshot->acquired_ms = 1000;
+    strcpy(s_snapshot->result.response.mqtt.username, "dev-123");
     strcpy(s_snapshot->result.response.websocket.url, "wss://gateway.example:8443/v1/realtime");
     strcpy(s_snapshot->result.response.websocket.token, "device-test-only");
     s_snapshot->result.response.websocket.expires_in = 3600;
@@ -164,7 +171,9 @@ static void fresh(void)
     client_started = credentials_from_handshake = fail_alloc = fail_client = fail_send = fail_stop = false;
     creates = stops = connects = recoveries = ends = 0;
     sent[0] = source_name[0] = configured_url[0] = 0;
+    auth_sent = standby_auth = false; preconnect_until_ms = 0; auth_device_id[0] = 0;
     session_requested = network_ready = true; provisioning = false;
+    preconnect_unsupported = false;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
     reminder_task=NULL; reminder_task_count=0; reminder_device_id[0]=0;
     retry_at_ms = test_now; auth_deadline_ms = 0;
@@ -188,11 +197,13 @@ static void handshake_poll_checks(void)
 {
     fresh();
     handshake_attempt_t *cached = s_snapshot;
+    unsigned cache_epoch = device_handshake_service_websocket_epoch();
     const device_handshake_response_t *response = NULL;
     ++s_network_epoch;
     CHECK(!device_handshake_service_get_configuration()); /* 回调后、poll 前也不可用。 */
     device_handshake_service_poll(false);
     CHECK(s_snapshot == cached && !s_schedule.ready && !s_schedule.online && !http_requests);
+    CHECK(device_handshake_service_websocket_epoch() != cache_epoch);
     CHECK(s_cancel_generation == s_schedule.generation && s_mqtt_epoch == 1);
     CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
     ++s_network_epoch;
@@ -302,6 +313,7 @@ static void connection_checks(void)
     CHECK(!strcmp(cJSON_GetObjectItem(reminder,"api_key")->valuestring,"device-test-only"));
     CHECK(!strcmp(cJSON_GetObjectItem(reminder,"device_id")->valuestring,"dev-123"));
     CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(reminder,"task_ids"))==2);
+    CHECK(cJSON_IsObject(cJSON_GetObjectItem(reminder,"audio_format")) && !cJSON_GetObjectItem(reminder,"preconnect"));
     CHECK(!cJSON_GetObjectItem(reminder,"content")); cJSON_Delete(reminder);
     fresh(); s_schedule.ready = false;
     for (unsigned i = 0; i < 10; ++i) retry_voice_connection(test_now);
@@ -315,9 +327,16 @@ static void connection_checks(void)
     CHECK(ws_service_authenticate() == ESP_OK);
     CHECK(strcmp(source_name, "HTTP/handshake/websocket.token") == 0);
     cJSON *json = cJSON_Parse(sent); CHECK(json != NULL);
-    CHECK(strcmp(cJSON_GetObjectItemCaseSensitive(json, "token")->valuestring, "device-test-only") == 0);
+    CHECK(strcmp(cJSON_GetObjectItemCaseSensitive(json, "api_key")->valuestring, "device-test-only") == 0);
+    CHECK(!strcmp(cJSON_GetObjectItem(json,"device_id")->valuestring, "dev-123"));
+    CHECK(!strcmp(cJSON_GetObjectItem(cJSON_GetObjectItem(json,"audio_format"),"encoding")->valuestring, "opus"));
+    CHECK(!cJSON_GetObjectItem(json,"preconnect"));
     cJSON_Delete(json);
     CHECK(ws_service_set_credentials("wss://other.example", "x") == ESP_ERR_INVALID_STATE);
+    fresh(); preconnect_unsupported = true; retry_voice_connection(test_now);
+    state=WS_STATE_AUTHING; CHECK(ws_service_authenticate()==ESP_OK);
+    json=cJSON_Parse(sent); CHECK(json && cJSON_GetObjectItem(json,"token") && !cJSON_GetObjectItem(json,"preconnect"));
+    cJSON_Delete(json);
     fresh(); s_disabled = true; retry_voice_connection(test_now);
     CHECK(connects == 1 && !credentials_from_handshake && strcmp(credentials->token, "legacy-test-only") == 0);
     state = WS_STATE_AUTHING; CHECK(ws_service_authenticate() == ESP_OK);
@@ -346,6 +365,7 @@ static void lifetime_and_failure_checks(void)
     ++test_now;
     CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
     CHECK(!s_snapshot && !s_schedule.ready && s_schedule.generation == 2);
+    CHECK(device_handshake_service_websocket_epoch() == s_schedule.generation);
     for (unsigned i = 0; i < 10; ++i)
         CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
     CHECK(s_schedule.generation == 2); /* 轮询不会重新刷新或重置退避。 */
@@ -389,10 +409,40 @@ static void credential_boundary_checks(void)
     CHECK(strcmp(credentials->url, "wss://new.example") == 0 && strcmp(credentials->token, "new-token") == 0);
 }
 
+static void preconnect_send_checks(void)
+{
+    fresh();
+    CHECK(ws_service_prepare_preconnect("dev-1")==ESP_ERR_INVALID_STATE);
+    CHECK(ws_service_set_credentials("wss://gateway.example","quoted\"token")==ESP_OK);
+    CHECK(ws_service_prepare_preconnect("")==ESP_ERR_INVALID_ARG);
+    CHECK(ws_service_prepare_preconnect("dev-1")==ESP_OK);
+    state=WS_STATE_PREAUTHING;
+    CHECK(ws_service_activate_preconnection()==ESP_ERR_INVALID_STATE);
+    CHECK(ws_service_authenticate()==ESP_OK && auth_sent);
+    cJSON *json=cJSON_Parse(sent); CHECK(json!=NULL);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(json,"preconnect")));
+    CHECK(!strcmp(cJSON_GetObjectItem(json,"api_key")->valuestring,"quoted\"token"));
+    CHECK(!strcmp(cJSON_GetObjectItem(json,"device_id")->valuestring,"dev-1"));
+    cJSON *format=cJSON_GetObjectItem(json,"audio_format"); CHECK(cJSON_IsObject(format));
+    CHECK(!strcmp(cJSON_GetObjectItem(format,"encoding")->valuestring,"opus"));
+    CHECK(cJSON_GetObjectItem(format,"sample_rate")->valueint==16000 && cJSON_GetObjectItem(format,"channels")->valueint==1);
+    CHECK(!cJSON_GetObjectItem(json,"task_ids")); cJSON_Delete(json);
+    state=WS_STATE_PRECONNECTED; preconnect_until_ms=(uint32_t)test_now;
+    CHECK(!ws_service_preconnect_valid() && ws_service_activate_preconnection()==ESP_ERR_INVALID_STATE);
+    preconnect_until_ms+=1000;
+    strcpy(reminder_task_ids[0],"21"); reminder_task_count=1;
+    CHECK(ws_service_activate_preconnection()==ESP_OK && state==WS_STATE_ACTIVATING);
+    CHECK(ws_service_activate_preconnection()==ESP_ERR_INVALID_STATE && ws_service_authenticate()==ESP_ERR_INVALID_STATE);
+    json=cJSON_Parse(sent); CHECK(json!=NULL && !cJSON_GetObjectItem(json,"preconnect"));
+    CHECK(!strcmp(cJSON_GetObjectItem(json,"device_id")->valuestring,"dev-1"));
+    CHECK(!strcmp(cJSON_GetArrayItem(cJSON_GetObjectItem(json,"task_ids"),0)->valuestring,"21"));
+    CHECK(cJSON_IsObject(cJSON_GetObjectItem(json,"audio_format"))); cJSON_Delete(json);
+}
+
 int main(void)
 {
     handshake_poll_checks(); builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
-    release_credentials(credentials); clear_snapshot();
+    preconnect_send_checks(); release_credentials(credentials); clear_snapshot();
     printf("PASS: %u device voice authentication checks (production code; mocked transport)\n", checks);
     return 0;
 }

@@ -60,7 +60,7 @@ static bool copy_field(const cJSON *object, const char *key, char *out, size_t s
     return true;
 }
 
-proto_event_t proto_parse_speech_event(const char *json_str)
+proto_event_t proto_parse_priority_event(const char *json_str)
 {
     if (!json_str || !safe_structure(json_str)) return PROTO_EVT_UNKNOWN;
     const char *end = NULL;
@@ -74,6 +74,8 @@ proto_event_t proto_parse_speech_event(const char *json_str)
                 event = PROTO_EVT_SPEECH_STARTED;
             else if (strcmp(type->valuestring, "input_audio_buffer.speech_stopped") == 0)
                 event = PROTO_EVT_SPEECH_STOPPED;
+            else if (strcmp(type->valuestring, "session.closed") == 0)
+                event = PROTO_EVT_SESSION_CLOSED;
         }
     }
     cJSON_Delete(root);
@@ -99,6 +101,24 @@ proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)
      * 不为兼容不同模型强制 response ID、status 或输出数组的结构。 */
     if (strcmp(type, "__proxy_connected__") == 0) {
         msg->evt = PROTO_EVT_PROXY_CONNECTED;
+        const cJSON *format = cJSON_GetObjectItemCaseSensitive(root, "audio_format");
+        msg->has_audio_format = format != NULL;
+        if (cJSON_IsObject(format)) {
+            const cJSON *encoding = cJSON_GetObjectItemCaseSensitive(format, "encoding");
+            const cJSON *rate = cJSON_GetObjectItemCaseSensitive(format, "sample_rate");
+            const cJSON *channels = cJSON_GetObjectItemCaseSensitive(format, "channels");
+            msg->opus_16k_mono = cJSON_IsString(encoding) && !strcmp(encoding->valuestring, "opus") &&
+                cJSON_IsNumber(rate) && rate->valuedouble == 16000 &&
+                cJSON_IsNumber(channels) && channels->valuedouble == 1;
+        }
+    } else if (strcmp(type, "__preconnect_ready__") == 0) {
+        const cJSON *ttl = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+        if (!cJSON_IsNumber(ttl) || ttl->valueint <= 0 || ttl->valueint != ttl->valuedouble)
+            goto done;
+        msg->evt = PROTO_EVT_PRECONNECT_READY;
+        msg->expires_in = (uint32_t)ttl->valueint;
+    } else if (strcmp(type, "session.closed") == 0) {
+        msg->evt = PROTO_EVT_SESSION_CLOSED;
     } else if (strcmp(type, "input_audio_buffer.speech_started") == 0 ||
                strcmp(type, "conversation.item.input_audio_transcription.started") == 0) {
         msg->evt = PROTO_EVT_SPEECH_STARTED;
@@ -186,24 +206,36 @@ static bool reminder_task_id_valid(const char *id)
     return true;
 }
 
-size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
-                                       const char *device_id,
-                                       const char *const *task_ids, size_t task_count)
+static size_t build_device_auth(char *buf, size_t buf_size, const char *token,
+                                const char *device_id, bool negotiate, bool preconnect,
+                                const char *const *task_ids, size_t task_count)
 {
     if (!buf || !buf_size) return 0;
     buf[0] = 0;
     if (!token || !*token || strlen(token) > PROTO_AUTH_TOKEN_MAX ||
-        !device_id || !*device_id || strlen(device_id) > 64 || !task_ids ||
-        task_count == 0 || task_count > PROTO_REMINDER_TASK_IDS_MAX) return 0;
+        !device_id || !*device_id || strlen(device_id) > 64 ||
+        (task_count && !task_ids) || task_count > PROTO_REMINDER_TASK_IDS_MAX ||
+        (preconnect && task_count) || (!negotiate && !task_count)) return 0;
     for (size_t i = 0; i < task_count; ++i)
         if (!reminder_task_id_valid(task_ids[i])) return 0;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *ids = cJSON_CreateArray();
-    bool ok = root && ids &&
+    bool ok = root &&
         cJSON_AddStringToObject(root, "type", "auth") &&
         cJSON_AddStringToObject(root, "api_key", token) &&
         cJSON_AddStringToObject(root, "device_id", device_id);
+    if (ok && preconnect) ok = cJSON_AddBoolToObject(root, "preconnect", true) != NULL;
+    if (ok && negotiate) {
+        cJSON *format = cJSON_AddObjectToObject(root, "audio_format");
+        ok = format && cJSON_AddStringToObject(format, "encoding", "opus") &&
+            cJSON_AddNumberToObject(format, "sample_rate", 16000) &&
+            cJSON_AddNumberToObject(format, "channels", 1);
+    }
+    cJSON *ids = NULL;
+    if (ok && task_count) {
+        ids = cJSON_AddArrayToObject(root, "task_ids");
+        ok = ids != NULL;
+    }
     for (size_t i = 0; ok && i < task_count; ++i) {
         cJSON *id = cJSON_CreateString(task_ids[i]);
         if (!id || !cJSON_AddItemToArray(ids, id)) {
@@ -211,22 +243,27 @@ size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *t
             ok = false;
         }
     }
-    if (ok) {
-        ok = cJSON_AddItemToObject(root, "task_ids", ids);
-        if (ok) ids = NULL;
-    }
     char *json = ok ? cJSON_PrintUnformatted(root) : NULL;
     size_t length = json ? strlen(json) : 0;
-    if (!length || length >= buf_size) {
-        if (buf_size) buf[0] = 0;
-        length = 0;
-    } else {
-        memcpy(buf, json, length + 1);
-    }
+    if (length && length < buf_size) memcpy(buf, json, length + 1);
+    else length = 0;
     cJSON_free(json);
-    cJSON_Delete(ids);
     cJSON_Delete(root);
     return length;
+}
+
+size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
+                                       const char *device_id,
+                                       const char *const *task_ids, size_t task_count)
+{
+    return build_device_auth(buf, buf_size, token, device_id, false, false, task_ids, task_count);
+}
+
+size_t proto_build_d3_auth_frame(char *buf, size_t buf_size, const char *token,
+                                 const char *device_id, bool preconnect,
+                                 const char *const *task_ids, size_t task_count)
+{
+    return build_device_auth(buf, buf_size, token, device_id, true, preconnect, task_ids, task_count);
 }
 
 size_t proto_build_input_audio_append(char *buf, size_t buf_size,
@@ -263,6 +300,8 @@ const char *proto_event_name(proto_event_t evt)
 {
     switch (evt) {
         case PROTO_EVT_PROXY_CONNECTED: return "PROXY_CONNECTED";
+        case PROTO_EVT_PRECONNECT_READY: return "PRECONNECT_READY";
+        case PROTO_EVT_SESSION_CLOSED:   return "SESSION_CLOSED";
         case PROTO_EVT_ERROR:           return "ERROR";
         case PROTO_EVT_SPEECH_STARTED:  return "SPEECH_STARTED";
         case PROTO_EVT_SPEECH_STOPPED:  return "SPEECH_STOPPED";

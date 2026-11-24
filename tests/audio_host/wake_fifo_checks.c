@@ -24,7 +24,7 @@ static RingbufHandle_t s_ringbuf=(void*)1;
 static RingbufHandle_t s_live_ringbuf=(void*)3;
 static SemaphoreHandle_t s_audio_buffer_lock=(void*)2;
 static bool s_audio_buffer_enabled=true;
-static bool s_pre_roll_enabled, s_pre_roll_uploading;
+static bool s_pre_roll_enabled, s_pre_roll_uploading, s_hot_pre_roll;
 static bool s_first_phrase_speech_seen, s_first_phrase_closed, s_live_buffer_active;
 static uint32_t s_first_phrase_silence_samples, s_first_phrase_end, s_live_read_end;
 static uint32_t s_wake_boundary_sample, s_afe_sample_end, s_pre_roll_dropped_frames;
@@ -125,6 +125,34 @@ static void normal_fifo_checks(void)
 }
 
 #if WAKE_WORD_CONNECT_PRE_ROLL_ENABLED
+static void hot_fallback_checks(void)
+{
+    reset();
+    wake_word_select_hot_pre_roll();
+    push_frame(1000,false);
+    CHECK(!s_hot_pre_roll && !queued && !wake_word_prepare_pre_roll_upload());
+    push_frame(900,true);
+    push_frame(1,false); /* The event loop has not processed the wake yet. */
+    wake_word_select_hot_pre_roll();
+    wake_word_select_hot_pre_roll();
+    CHECK(s_hot_pre_roll && queued==1);
+    current=APP_STATE_WS_CONNECTING_WAKE;
+    wake_word_fallback_cold_pre_roll();
+    CHECK(!s_hot_pre_roll && s_pre_roll_enabled && queued==1);
+    for(unsigned i=2;i<=50;++i) push_frame((int16_t)i,false);
+    CHECK(queued==50 && !s_pre_roll_dropped_frames);
+    CHECK(wake_word_prepare_pre_roll_upload());
+    current=APP_STATE_LISTENING;
+    for(unsigned i=1;i<=50;++i) read_frame((int16_t)i);
+
+    reset(); push_frame(900,true); wake_word_select_hot_pre_roll(); push_frame(1,false);
+    wake_word_set_pre_roll(false); /* Cancel must not upload a previous wake. */
+    CHECK(!s_hot_pre_roll && !queued && !wake_word_prepare_pre_roll_upload());
+    push_frame(901,true); push_frame(2,false);
+    CHECK(!s_hot_pre_roll && wake_word_prepare_pre_roll_upload());
+    read_frame(2);
+}
+
 static void transmit_boundary_checks(void)
 {
     reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE;
@@ -236,6 +264,57 @@ static void enter_lite_mode(void)
     s_mode=WAKE_WORD_MODE_LITE;
     reset_first_phrase_detector_locked();
 }
+static void hot_handoff_checks(unsigned frames)
+{
+    reset();
+    s_afe_sample_end=UINT32_MAX-1023; /* The first sample position may wrap through zero. */
+    push_frame(900,true); wake_word_select_hot_pre_roll();
+    current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
+    for(unsigned i=1;i<=frames;++i)
+        push_vad_frame((int16_t)(1000+i),false,i==1 ? VAD_SPEECH : VAD_SILENCE);
+    CHECK(queued==frames && !s_first_phrase_closed);
+    uint32_t boundary=s_audio_progress.written_end;
+    CHECK(wake_word_prepare_pre_roll_upload());
+    CHECK(s_first_phrase_closed && s_first_phrase_end==boundary);
+    push_frame(2001,false); /* Producer wins the lock before the encoder starts. */
+    CHECK(wake_word_prepare_pre_roll_upload() && s_first_phrase_end==boundary);
+    CHECK(queued==frames && live_queued==1);
+    current=APP_STATE_LISTENING;
+    /* Feed the entire prefix and the live frame into the same reader; no
+     * voice boundary, successful TX or network confirmation is needed. */
+    int16_t output[512]; uint32_t end=0;
+    for(unsigned i=1;i<=frames;++i) {
+        CHECK(wake_word_read_audio(output,sizeof(output),&end)==sizeof(output));
+        CHECK(output[0]==1000+i && end==s_wake_boundary_sample+512u*i);
+    }
+    CHECK(wake_word_read_audio(output,sizeof(output),&end)==sizeof(output));
+    CHECK(output[0]==2001 && end==boundary+512u && s_live_buffer_active);
+    CHECK(!s_hot_pre_roll && !s_pre_roll_enabled && !live_queued && !queued);
+}
+
+static void hot_slow_activation_checks(void)
+{
+    reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE;
+    wake_word_select_hot_pre_roll(); enter_lite_mode();
+    for(unsigned i=1;i<=20;++i) push_frame((int16_t)(1000+i),false);
+    CHECK(queued==20 && !s_pre_roll_dropped_frames && !s_first_phrase_closed);
+    CHECK(wake_word_prepare_pre_roll_upload() && s_first_phrase_closed);
+    current=APP_STATE_LISTENING; push_frame(2001,false);
+    for(unsigned i=1;i<=20;++i) read_frame((int16_t)(1000+i));
+    read_frame(2001);
+
+    reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE;
+    wake_word_select_hot_pre_roll(); enter_lite_mode();
+    for(unsigned i=1;i<=19;++i)
+        push_vad_frame((int16_t)(1000+i),false,i==1 ? VAD_SPEECH : VAD_SILENCE);
+    CHECK(s_first_phrase_closed && queued==17 && live_queued==2);
+    uint32_t boundary=s_first_phrase_end;
+    CHECK(wake_word_prepare_pre_roll_upload() && s_first_phrase_end==boundary);
+    current=APP_STATE_LISTENING;
+    for(unsigned i=1;i<=19;++i) read_frame((int16_t)(1000+i));
+    CHECK(!s_hot_pre_roll && s_audio_progress.read_end==s_audio_progress.written_end);
+}
+
 static void first_phrase_handoff_checks(void)
 {
     /* Silence before the first speech is not a phrase; a short gap is retained. */
@@ -366,6 +445,8 @@ static void first_phrase_disabled_checks(void)
 static void disabled_checks(void)
 {
     reset(); push_frame(900,true); push_frame(901,false);
+    wake_word_select_hot_pre_roll(); wake_word_fallback_cold_pre_roll();
+    CHECK(!s_hot_pre_roll);
     CHECK(!queued && !s_pre_roll_enabled && !wake_word_prepare_pre_roll_upload());
     current=APP_STATE_WS_CONNECTING_WAKE;
     for(unsigned i=0;i<157;++i) push_frame(902,false);
@@ -380,11 +461,15 @@ int main(void)
 {
     normal_fifo_checks();
 #if WAKE_WORD_CONNECT_PRE_ROLL_ENABLED
+    hot_fallback_checks();
     transmit_boundary_checks();
     handshake_checks(63);  /* 2016 ms建连 */
     handshake_checks(157); /* 5024 ms建连 */
     boundary_and_cancel_checks(); overflow_checks();
 #if WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED
+    hot_handoff_checks(0); hot_handoff_checks(1);
+    hot_handoff_checks(5); hot_handoff_checks(16);
+    hot_slow_activation_checks();
     first_phrase_handoff_checks(); first_phrase_empty_live_and_wrap_checks();
     first_phrase_mode_boundary_checks();
 #else

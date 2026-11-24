@@ -18,14 +18,17 @@ def main():
     # 直接提取生产函数；主机桩只替换 RTOS、网络和外设依赖。
     source = (root / "main/app_main.c").read_text(encoding="utf-8")
     (output / "app_session.inc").write_text("\n\n".join(extract(source, name) for name in
-        ("release_reminder", "stop_session_audio", "end_conversation", "start_audio_session", "start_conversation",
-         "poll_conversation", "handle_talk_action", "poll_reminder")), encoding="utf-8")
+        ("release_reminder", "stop_session_audio", "end_conversation", "start_audio_session",
+         "abandon_preconnection", "poll_preconnection", "handle_preconnection_event", "start_conversation",
+         "poll_conversation", "handle_talk_action", "tagged_ws_event", "poll_reminder")), encoding="utf-8")
     ws = (root / "main/ws_service.c").read_text(encoding="utf-8")
     end = ws.index("} rx_frame_t;") + len("} rx_frame_t;")
     start = ws.rindex("typedef struct {", 0, end)
-    names = ("reset_speech_status", "ws_service_get_speech_status", "observe_speech_event",
+    (output / "ws_control.inc").write_text("\n\n".join(extract(ws, name) for name in
+        ("publish", "ws_service_take_pending_event")), encoding="utf-8")
+    names = ("current", "reset_speech_status", "ws_service_get_speech_status", "observe_speech_event",
              "observe_rx_packet", "release_rx_frame", "drop_audio", "enqueue_rx_frame",
-             "handle_frame", "on_ws", "ws_service_prepare_reminder")
+             "ws_service_preconnect_valid", "handle_frame", "on_ws", "ws_service_prepare_reminder")
     (output / "ws_platform.inc").write_text(ws[start:end] + "\n" +
         "\n\n".join(extract(ws, name) for name in names), encoding="utf-8")
     (output / "ws_upload.inc").write_text(extract(ws, "ws_service_send_opus_frame"), encoding="utf-8")
@@ -47,7 +50,8 @@ def main():
         ("audio_buffer_frames_locked", "discard_oldest_audio_locked", "clear_audio_buffer_locked",
          "afe_frame_energy", "reset_first_phrase_detector_locked", "observe_first_phrase_locked",
          "buffer_afe_audio", "wake_word_set_audio_buffer_enabled",
-         "wake_word_set_pre_roll", "wake_word_prepare_pre_roll_upload",
+         "wake_word_set_pre_roll", "wake_word_select_hot_pre_roll",
+         "wake_word_fallback_cold_pre_roll", "wake_word_prepare_pre_roll_upload",
          "wake_word_read_audio", "wake_word_confirm_audio_sent")), encoding="utf-8")
     cases = {
         "wifi-audio-checks": ["-Itests/audio_host", "-Iwork/speech-handoff",
@@ -76,6 +80,8 @@ def main():
         "app-session-checks": ["-Itests/audio_host", "-Itests/ui_host", "-Itests/host",
                                "-Iwork/speech-handoff", "tests/audio_host/app_session_checks.c"],
     }
+    cases["app-session-preconnect-disabled-checks"] = [
+        "-DDEVICE_WS_PRECONNECT_ENABLED=0", *cases["app-session-checks"]]
     for name, sources in cases.items():
         executable = output / (name + ".exe")
         with (output / (name + ".log")).open("w", encoding="utf-8") as log:

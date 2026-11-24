@@ -278,6 +278,7 @@ const device_handshake_response_t *device_handshake_service_get_configuration(vo
 
 bool device_handshake_service_is_enabled(void) { return !s_disabled; }
 bool device_handshake_service_is_blocked(void) { return !s_initialized || s_schedule.blocked; }
+unsigned device_handshake_service_websocket_epoch(void) { return s_schedule.generation; }
 unsigned device_handshake_service_mqtt_epoch(void) { return s_mqtt_epoch; }
 
 bool device_handshake_service_renew_credentials(void)

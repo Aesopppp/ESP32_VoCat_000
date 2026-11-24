@@ -1,14 +1,14 @@
 # ESP32_VoCatXKorvo_RE
 
-在 YMOS Korvo 工程结构上实现的 **VoCat v1.2 触屏语音终端**，工作目录为 `D:\ESP32_VoCatXKorvo`。使用 ESP-IDF 6.1，保留 C 模块、事件总线和 ACOS WebSocket 协议。
+在 YMOS Korvo 工程结构上实现的 **VoCat v1.2 触屏语音终端**。使用 ESP-IDF 6.1、C 模块和事件总线，通过 WebSocket 连接语音平台。
 
 公开仓库：[Aesopppp/ESP32_VoCatXKorvo_RE](https://github.com/Aesopppp/ESP32_VoCatXKorvo_RE)，承接 [ESP32_VoCatXKorvo](https://github.com/Aesopppp/ESP32_VoCatXKorvo) 的源码和提交历史。基于 [YMOS ESP32 工程](https://github.com/zhangff-2021/ymos-esp32) 的本地备份提交 `91d1c9aa320349d2d512dd9e7ba90409091386a8` 适配，硬件配置参考已验证的 VoCat 实现。历史从脱敏后的 VoCat 源码快照开始保存。
 
 ## 本版功能
 
-- 本地唤醒词 **“你好小智”**；唤醒后连接 WebSocket，开始连续对话。
+- 本地唤醒词 **“你好小智”**。设备可在待机时预连接 WebSocket，唤醒后复用连接，并按顺序上传紧接唤醒词说出的第一句话。网关协议、开关与联测步骤见[待机预连接与首句上传](docs/wake-first-phrase.md)。
 - ES7210 麦克风及硬件扬声器回采，AFE 回声消除与 VAD；16 kHz Opus 音频。
-- 统一全双工会话：鉴权后连续上传麦克风，同时播放下行 Opus。AI、电话和提醒共用收发链路，不依赖 speech/response 事件开启或结束播放；平台停发后播完已接收缓存。双向连续 60 秒无有效语音后待机。
+- 统一全双工会话。鉴权后连续上传麦克风，同时播放下行 Opus。AI、电话和提醒共用收发链路。平台停发后播完已接收缓存。平台没有标记用户正在说话、下行也持续安静满 30 秒时回到待机。
 - 全双工音频优先：上行 Opus 复杂度 0，16 kHz/单声道/20 ms/24 kbps 不变；连续上传期间关闭 Wi-Fi modem sleep，结束后恢复。保留 512 ms 有界收音 FIFO 和丢帧诊断，验收见 [统一全双工](docs/unified-full-duplex.md)。
 - 平台负责语音打断；设备不发送 response.cancel、不按本地人声清空播放。短音频没有结束事件也能起播，缓存排空后可直接接续新音频。
 - NVS Wi-Fi 保存和本地网页配网；运行中 **BOOT 长按 3 秒进入配网**，短按无操作。

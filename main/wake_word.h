@@ -153,8 +153,16 @@ void wake_word_set_audio_buffer_enabled(bool enabled);
  *  仅 false 有效；启用只能由 detect_Task 的真实 WakeNet 判定触发。 */
 void wake_word_set_pre_roll(bool enabled);
 
-/** 鉴权后、创建上传任务前调用。true 表示从 WakeNet 判定帧末端起的
- *  PCM 已保留并进入补传保护；首句读完后切实时，或提前追到 512 ms 内恢复。
+/** Select activation-ACK handoff for the current WakeNet recording only.
+ * Standby pre-authentication, touch and reminders do not start a recording. */
+void wake_word_select_hot_pre_roll(void);
+/** The same wake must open a fresh connection. Preserve the recorded prefix
+ * and resume the cold first-phrase policy. Only effective before upload. */
+void wake_word_fallback_cold_pre_roll(void);
+
+/** 正式鉴权成功后、创建上传任务前调用。热连接冻结截至此刻的 PCM，
+ *  编码端读完即切实时；激活慢时允许冷连接的句尾保护。冷连接沿用
+ *  首句读完或追到 512 ms 内切实时。true 表示已接管此轮 WakeNet 预录音。
  *  false 表示无有效预录音，主调继续旧清空行为。不会启停 AFE 或上传任务。 */
 bool wake_word_prepare_pre_roll_upload(void);
 

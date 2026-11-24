@@ -56,6 +56,8 @@ typedef enum {
     PROTO_EVT_RESPONSE_CREATED     = 7,
     PROTO_EVT_RESPONSE_TOOL        = 8,
     PROTO_EVT_RESPONSE_MESSAGE     = 9,
+    PROTO_EVT_PRECONNECT_READY,
+    PROTO_EVT_SESSION_CLOSED,
 } proto_event_t;
 
 /* ---- Parsed message (owns its strings; no JSON/cJSON lifetime dependency) -- */
@@ -63,6 +65,9 @@ typedef struct {
     proto_event_t  evt;             /* mapped event id                       */
     char           raw_type[80];
     int            raw_type_len;
+    uint32_t       expires_in;      /* __preconnect_ready__ 租期，单位秒 */
+    bool           has_audio_format;
+    bool           opus_16k_mono;
 
     /* error frame */
     int            error_code;
@@ -96,9 +101,9 @@ bool proto_is_auth_error(const proto_msg_t *msg);
  * @param msg      output, caller-owned.
  */
 proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg);
-/* 接收侧低频控制帧快通道，只返回精确的 speech_started/stopped。
+/* 接收侧低频控制帧快通道，识别精确的 speech_started/stopped 和 session.closed。
  * 无效 JSON、重复字段、转录别名及其他事件返回 UNKNOWN，不分配 proto_msg_t。 */
-proto_event_t proto_parse_speech_event(const char *json_str);
+proto_event_t proto_parse_priority_event(const char *json_str);
 
 /**
  * @brief Build `auth` JSON frame (first message after WebSocket open).
@@ -115,6 +120,9 @@ size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token);
 size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
                                        const char *device_id,
                                        const char *const *task_ids, size_t task_count);
+size_t proto_build_d3_auth_frame(char *buf, size_t buf_size, const char *token,
+                                 const char *device_id, bool preconnect,
+                                 const char *const *task_ids, size_t task_count);
 
 /**
  * @brief Build `input_audio_buffer.append` JSON frame.
