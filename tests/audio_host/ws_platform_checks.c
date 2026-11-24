@@ -41,7 +41,7 @@ enum { WEBSOCKET_EVENT_BEFORE_CONNECT, WEBSOCKET_EVENT_CONNECTED,
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 static void publish(app_event_id_t id,uint32_t gen)
 { CHECK(gen==generation); ++events[id]; }
-#define current(p) ((p)->generation==generation && (state==WS_STATE_CONNECTED || state==WS_STATE_AUTHING))
+#define current(p) ((p)->generation==generation && (state==WS_STATE_CONNECTED || state==WS_STATE_AUTHING || state==WS_STATE_PRECONNECTED))
 BaseType_t xSemaphoreTake(SemaphoreHandle_t s,TickType_t ticks) { (void)s; (void)ticks; return pdTRUE; }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return pdTRUE; }
 UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) { (void)q; return queued; }

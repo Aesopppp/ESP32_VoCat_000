@@ -46,6 +46,7 @@ typedef enum {
     /* auth / handshake */
     PROTO_EVT_PROXY_CONNECTED      = 1,  /* __proxy_connected__ */
     PROTO_EVT_ERROR                = 2,  /* error */
+    PROTO_EVT_PRECONNECT_READY     = 10, /* __preconnect_ready__ */
     /* VAD events from server */
     PROTO_EVT_SPEECH_STARTED       = 3,  /* input_audio_buffer.speech_started */
     PROTO_EVT_SPEECH_STOPPED       = 4,  /* input_audio_buffer.speech_stopped */
@@ -111,6 +112,8 @@ proto_event_t proto_parse_speech_event(const char *json_str);
  * @return          length written (>=0), 0 on failure
  */
 size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token);
+/** D3 preconnect builder: first auth validates the device but does not start a session. */
+size_t proto_build_preconnect_auth_frame(char *buf, size_t buf_size, const char *token);
 /* Reminder sessions carry device identity and the platform task IDs in auth. */
 size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
                                        const char *device_id,

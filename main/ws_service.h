@@ -37,7 +37,8 @@ typedef enum {
     WS_STATE_CONNECTING    = 1,  /* TCP/TLS handshaking */
     WS_STATE_AUTHING       = 2,  /* WS opened, auth sent, awaiting __proxy_connected__ */
     WS_STATE_CONNECTED     = 3,  /* auth ok, ready to send/receive audio */
-    WS_STATE_ERROR         = 4,
+    WS_STATE_PRECONNECTED  = 4,  /* D3: preconnect auth ok, standby keepalive, no session */
+    WS_STATE_ERROR         = 5,
 } ws_conn_state_t;
 
 /* ---- Public API -------------------------------------------------------- */
@@ -66,6 +67,10 @@ esp_err_t ws_service_deinit(void);
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
 /** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
 esp_err_t ws_service_authenticate(void);
+/** D3: build/send first auth with preconnect=true; wait for __preconnect_ready__. */
+esp_err_t ws_service_preconnect(void);
+/** D3: activate the existing preconnected WS with a normal auth frame. */
+esp_err_t ws_service_activate_preconnect(void);
 uint32_t ws_service_generation(void);
 
 typedef struct {

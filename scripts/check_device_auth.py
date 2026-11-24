@@ -34,7 +34,8 @@ def main():
         "device_handshake_service.c": ("device_handshake_service_get_configuration",
             "device_handshake_service_is_enabled", "device_handshake_service_renew_credentials",
             "device_handshake_service_prepare_websocket"),
-        "ws_service.c": ("release_credentials", "ws_service_set_credentials", "ws_service_authenticate"),
+        "ws_service.c": ("release_credentials", "ws_service_set_credentials", "ws_service_authenticate",
+            "ws_service_preconnect", "ws_service_activate_preconnect"),
         "app_main.c": ("handle_voice_auth_failure", "retry_voice_connection"),
     }
     for file, names in groups.items():

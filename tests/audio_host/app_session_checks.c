@@ -72,7 +72,7 @@ esp_err_t app_state_start_listening(void)
 {
     ++starts;
     if(upload_result!=ESP_OK) return upload_result;
-    CHECK(ws_state==WS_STATE_CONNECTED);
+    CHECK(ws_state==WS_STATE_CONNECTED || ws_state==WS_STATE_PRECONNECTED);
     current_state=APP_STATE_LISTENING; upload.running=true; return ESP_OK;
 }
 esp_err_t app_state_back_to_wait_wake(void)
