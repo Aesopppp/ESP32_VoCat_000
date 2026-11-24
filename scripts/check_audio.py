@@ -28,7 +28,8 @@ def main():
         ("publish", "ws_service_take_pending_event")), encoding="utf-8")
     names = ("current", "reset_speech_status", "ws_service_get_speech_status", "observe_speech_event",
              "observe_rx_packet", "release_rx_frame", "drop_audio", "enqueue_rx_frame",
-             "ws_service_preconnect_valid", "handle_frame", "on_ws", "ws_service_prepare_reminder")
+             "ws_service_preconnect_valid", "ws_service_preconnect_refresh_due",
+             "handle_frame", "on_ws", "ws_service_prepare_reminder")
     (output / "ws_platform.inc").write_text(ws[start:end] + "\n" +
         "\n\n".join(extract(ws, name) for name in names), encoding="utf-8")
     (output / "ws_upload.inc").write_text(extract(ws, "ws_service_send_opus_frame"), encoding="utf-8")

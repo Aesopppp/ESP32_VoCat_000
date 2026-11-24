@@ -340,24 +340,27 @@ static void poll_preconnection(int64_t now, bool check_now)
             return;
         }
         if (ws_service_get_state() != WS_STATE_PRECONNECTED) return;
-        if (!ws_service_preconnect_valid()) {
-            abandon_preconnection("idle lease expired");
+        if (session_requested) {
+            if (!ws_service_preconnect_valid()) {
+                abandon_preconnection("idle lease expired");
+                return;
+            }
+            esp_err_t err = ESP_OK;
+            if (reminder_task) {
+                const char *ids[DEVICE_TASK_QUEUE_SIZE];
+                for (unsigned i = 0; i < reminder_task->count; ++i) ids[i] = reminder_task->task_ids[i];
+                err = ws_service_prepare_reminder(reminder_task->device_id, ids, reminder_task->count);
+            }
+            if (err == ESP_OK) err = ws_service_activate_preconnection();
+            if (err != ESP_OK) abandon_preconnection("activation send failed");
+            else {
+                preconnect_deadline_ms = now + 10000;
+                ESP_LOGI(TAG, "Activating standby WebSocket; waiting for __proxy_connected__");
+            }
             return;
         }
-        if (!session_requested) return;
-        esp_err_t err = ESP_OK;
-        if (reminder_task) {
-            const char *ids[DEVICE_TASK_QUEUE_SIZE];
-            for (unsigned i = 0; i < reminder_task->count; ++i) ids[i] = reminder_task->task_ids[i];
-            err = ws_service_prepare_reminder(reminder_task->device_id, ids, reminder_task->count);
-        }
-        if (err == ESP_OK) err = ws_service_activate_preconnection();
-        if (err != ESP_OK) abandon_preconnection("activation send failed");
-        else {
-            preconnect_deadline_ms = now + 10000;
-            ESP_LOGI(TAG, "Activating standby WebSocket; waiting for __proxy_connected__");
-        }
-        return;
+        if (!ws_service_preconnect_refresh_due()) return;
+        ESP_LOGI(TAG, "Refreshing idle WebSocket before next wake");
     }
     if (readiness != DEVICE_WS_READY) return;
     /* A previous transport stop can fail; retry cleanup before every new dial. */
@@ -372,7 +375,7 @@ static void poll_preconnection(int64_t now, bool check_now)
     }
     preconnect_epoch = epoch;
     preconnect_owned = true;
-    preconnect_deadline_ms = now + 20000;
+    preconnect_deadline_ms = now_ms() + 20000;
     ESP_LOGI(TAG, "Opening standby WebSocket");
 }
 

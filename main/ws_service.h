@@ -74,6 +74,8 @@ esp_err_t ws_service_prepare_preconnect(const char *device_id);
 /* 冷连接发送带身份和 Opus 格式的普通 auth（无 preconnect 字段）。 */
 esp_err_t ws_service_prepare_device_auth(const char *device_id);
 bool ws_service_preconnect_valid(void);
+/* 主任务仅在待机时使用刷新时间；已请求的会话仍可激活未到期的连接。 */
+bool ws_service_preconnect_refresh_due(void);
 esp_err_t ws_service_activate_preconnection(void);
 uint32_t ws_service_generation(void);
 /* Main task: terminal results and lifecycle notices that did not fit on the bus. */

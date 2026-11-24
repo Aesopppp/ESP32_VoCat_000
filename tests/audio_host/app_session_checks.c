@@ -18,6 +18,7 @@ static bool conversation_active, session_requested, cleanup_pending;
 static bool pre_roll_active, mode_kept_pre_roll, wake_on_return_to_idle;
 static unsigned pre_roll_prepares, pre_roll_cancels;
 static bool preconnect_owned, preconnect_unsupported, valid_lease, hot_pre_roll;
+static bool refresh_due;
 static bool preconnect_token_renewed, preconnect_token_blocked;
 static unsigned preconnect_epoch, preconnect_failures, http_epoch;
 static int64_t preconnect_deadline_ms, preconnect_poll_at_ms;
@@ -61,6 +62,7 @@ esp_err_t ws_service_prepare_reminder(const char *id,const char *const *tasks,si
 { CHECK(!strcmp(id,"dev_test") && count==2 && !strcmp(tasks[0],"a") && !strcmp(tasks[1],"b"));
   ++prepared_tasks; return ESP_OK; }
 bool ws_service_preconnect_valid(void) { return valid_lease && ws_state==WS_STATE_PRECONNECTED; }
+bool ws_service_preconnect_refresh_due(void) { return refresh_due && ws_state==WS_STATE_PRECONNECTED; }
 esp_err_t ws_service_activate_preconnection(void)
 { CHECK(ws_state==WS_STATE_PRECONNECTED); ++activations;
   if (activation_result==ESP_OK) ws_state=WS_STATE_ACTIVATING;
@@ -126,7 +128,7 @@ static void reset(void)
     preconnect_token_renewed=preconnect_token_blocked=false;
     preconnect_epoch=preconnect_failures=dials=preauth=activations=prepared_tasks=0;
     preconnect_deadline_ms=preconnect_poll_at_ms=0; http_epoch=1;
-    valid_lease=true; activation_result=ESP_OK; readiness=DEVICE_WS_READY;
+    valid_lease=true; refresh_due=false; activation_result=ESP_OK; readiness=DEVICE_WS_READY;
     strcpy(configuration.mqtt.username,"dev_test");
     strcpy(configuration.websocket.url,"wss://example"); strcpy(configuration.websocket.token,"test");
     strcpy(batch.device_id,"dev_test"); strcpy(batch.task_ids[0],"a"); strcpy(batch.task_ids[1],"b");
@@ -312,6 +314,73 @@ static void standby_ready(void)
     CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
     CHECK(!starts && !activations && preconnect_owned && !preconnect_deadline_ms);
 }
+static void standby_refresh_checks(void)
+{
+    reset();
+    standby_ready();
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    CHECK(dials==1 && preconnect_owned);
+
+    refresh_due=true;
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    CHECK(dials==2 && preconnect_owned && ws_state==WS_STATE_CONNECTING);
+    CHECK(!preconnect_failures && !retry_at_ms && http_epoch==1);
+    CHECK(!starts && !stops && !clears && !session_requested && !audio_active);
+    CHECK(current_state==APP_STATE_WAIT_WAKE && afe_mode==WAKE_WORD_MODE_WAKE);
+
+    /* The old standby socket is already closed. Preserve the first phrase on the new one. */
+    pre_roll_active=true;
+    start_conversation("wake word");
+    CHECK(pre_roll_active && !hot_pre_roll && !activations && !starts);
+    ws_state=WS_STATE_PREAUTHING;
+    CHECK(handle_preconnection_event(EV_WS_CONNECTED));
+    refresh_due=false;
+    ws_state=WS_STATE_PRECONNECTED;
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(activations==1 && dials==2 && !starts && !clears);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("wake during standby refresh");
+    CHECK(upload.running && pre_roll_prepares==1 && !clears);
+
+    /* If activation is requested before the old socket is closed, use its remaining lease. */
+    reset();
+    standby_ready();
+    refresh_due=pre_roll_active=true;
+    start_conversation("wake word");
+    CHECK(activations==1 && dials==1 && hot_pre_roll && !starts && !preconnect_failures);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("wake at refresh window");
+    clock_ms+=600000;
+    poll_preconnection(clock_ms,false);
+    CHECK(conversation_active && upload.running && dials==1 && !stops);
+
+    reset();
+    standby_ready();
+    refresh_due=true;
+    available=&batch;
+    poll_reminder();
+    CHECK(activations==1 && dials==1 && prepared_tasks==1 && reminder_task==&batch);
+    CHECK(!starts && !releases && !preconnect_failures);
+
+    reset();
+    standby_ready();
+    refresh_due=true;
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    available=&batch;
+    poll_reminder();
+    CHECK(reminder_task==&batch && !prepared_tasks && !activations && !releases);
+    ws_state=WS_STATE_PREAUTHING;
+    CHECK(handle_preconnection_event(EV_WS_CONNECTED));
+    refresh_due=false;
+    ws_state=WS_STATE_PRECONNECTED;
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    CHECK(prepared_tasks==1 && activations==1 && dials==2 && reminder_task==&batch);
+}
 static void standby_checks(void)
 {
     CHECK(tagged_ws_event(EV_WS_PRECONNECT_READY) && tagged_ws_event(EV_WS_SESSION_CLOSED));
@@ -371,7 +440,10 @@ static void standby_checks(void)
 int main(void)
 {
     silence_checks(); conversation_checks(); wake_pre_roll_checks(); task_checks(); touch_checks();
-    if (DEVICE_WS_PRECONNECT_ENABLED) standby_checks();
+    if (DEVICE_WS_PRECONNECT_ENABLED) {
+        standby_checks();
+        standby_refresh_checks();
+    }
     else {
         reset(); poll_preconnection(clock_ms, true);
         CHECK(!dials && !preconnect_owned && !session_requested);

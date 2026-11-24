@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
 #include <stdlib.h>
@@ -29,6 +30,7 @@ static bool credentials_from_handshake;
 static char auth_device_id[65];  /* 先配置，再启动 transport；stop 后清除。 */
 static bool standby_auth;
 static atomic_uint preconnect_until_ms;
+static atomic_uint preconnect_refresh_ms;
 static atomic_bool auth_sent, terminal_notified;
 static portMUX_TYPE control_lock = portMUX_INITIALIZER_UNLOCKED;
 static event_t pending_control;
@@ -313,9 +315,15 @@ static void handle_frame(const rx_frame_t *packet)
     } else if (msg.evt == PROTO_EVT_PRECONNECT_READY && phase == WS_STATE_PREAUTHING && auth_sent) {
         /* 低 32 位单调时钟，限制租期到有符号差值可比较的范围。 */
         uint32_t ttl_ms = msg.expires_in > INT32_MAX / 1000u ? INT32_MAX : msg.expires_in * 1000u;
+        /* 每条待机连接随机错开刷新。600 秒租期在第 500～540 秒重建。 */
+        uint32_t earliest_ms = ttl_ms - ttl_ms / 6;
+        uint32_t latest_ms = ttl_ms - ttl_ms / 10;
+        uint32_t refresh_in_ms = earliest_ms + esp_random() % (latest_ms - earliest_ms + 1u);
         atomic_store(&preconnect_until_ms, packet->received_ms + ttl_ms);
+        atomic_store(&preconnect_refresh_ms, packet->received_ms + refresh_in_ms);
         state = WS_STATE_PRECONNECTED;
-        ESP_LOGI(TAG, "Standby WebSocket ready: lease_s=%lu", (unsigned long)msg.expires_in);
+        ESP_LOGI(TAG, "Standby WebSocket ready: lease_s=%lu refresh_in_ms=%lu",
+                 (unsigned long)msg.expires_in, (unsigned long)refresh_in_ms);
         publish(EV_WS_PRECONNECT_READY, packet->generation);
     } else if (msg.evt == PROTO_EVT_PROXY_CONNECTED &&
                (phase == WS_STATE_PREAUTHING || phase == WS_STATE_PRECONNECTED)) {
@@ -604,6 +612,11 @@ bool ws_service_preconnect_valid(void)
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     return state == WS_STATE_PRECONNECTED && (int32_t)(atomic_load(&preconnect_until_ms) - now) > 0;
 }
+bool ws_service_preconnect_refresh_due(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return state == WS_STATE_PRECONNECTED && (int32_t)(now - atomic_load(&preconnect_refresh_ms)) >= 0;
+}
 static esp_err_t send_auth(bool activating)
 {
     ws_conn_state_t phase = atomic_load(&state);
@@ -674,6 +687,7 @@ esp_err_t ws_service_disconnect(void)
     auth_device_id[0] = 0;
     standby_auth = false;
     atomic_store(&preconnect_until_ms, 0);
+    atomic_store(&preconnect_refresh_ms, 0);
     atomic_store(&auth_sent, false);
     reminder_device_id[0] = 0;
     memset(reminder_task_ids, 0, sizeof(reminder_task_ids));

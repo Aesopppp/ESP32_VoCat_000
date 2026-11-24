@@ -25,7 +25,7 @@ static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MA
 static size_t reminder_task_count;
 static char auth_device_id[65];
 static bool standby_auth;
-static unsigned preconnect_until_ms;
+static unsigned preconnect_until_ms, preconnect_refresh_ms, random_value;
 static bool auth_sent, terminal_notified;
 static SemaphoreHandle_t playback_lock=(void*)1;
 static QueueHandle_t rx_queue=(void*)2;
@@ -76,7 +76,7 @@ static int audio_out_play_opus(const uint8_t *data,size_t len)
     if (inject_disconnect) { state=WS_STATE_DISCONNECTED; stop_flag=true; return -1; }
     ++decoded; return decoded_samples;
 }
-uint32_t esp_random(void) { return 1; }
+uint32_t esp_random(void) { return random_value; }
 int64_t esp_timer_get_time(void) { return (int64_t)clock_ms * 1000; }
 #include "ws_platform.inc"
 static rx_frame_t pending[64];
@@ -116,7 +116,8 @@ static void reset(void)
     CHECK(rx_bytes==0);
     state=WS_STATE_CONNECTED; stop_flag=client_started=inject_disconnect=queue_fail=false;
     played_frames=0; decoded_samples=960; clock_ms=1000; reminder_task_count=0;
-    auth_sent=true; standby_auth=terminal_notified=false; preconnect_until_ms=0; auth_device_id[0]=0;
+    auth_sent=true; standby_auth=terminal_notified=false; preconnect_until_ms=preconnect_refresh_ms=0;
+    random_value=1; auth_device_id[0]=0;
     reset_speech_status();
     memset(reminder_device_id,0,sizeof(reminder_device_id));
     memset(reminder_task_ids,0,sizeof(reminder_task_ids));
@@ -337,6 +338,45 @@ static void preconnect_checks(void)
     reset(); state=WS_STATE_AUTHING; strcpy(auth_device_id,"dev-1"); control(missing);
     CHECK(events[EV_WS_FORMAT_ERROR]==1 && !events[EV_WS_AUTH_OK]);
 }
+static void preconnect_refresh_checks(void)
+{
+    const uint32_t start = UINT32_MAX - 100u;
+    const uint32_t seeds[] = {0, 9999, UINT32_MAX};
+    uint32_t first_delay = 0;
+    bool staggered = false;
+    for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); ++i) {
+        reset();
+        clock_ms = start;
+        state = WS_STATE_PREAUTHING;
+        random_value = seeds[i];
+        control("{\"type\":\"__preconnect_ready__\",\"expires_in\":600}");
+        uint32_t delay = preconnect_refresh_ms - start;
+        CHECK(delay >= 500000 && delay <= 540000);
+        if (i == 0) first_delay = delay;
+        else if (delay != first_delay) staggered = true;
+        clock_ms = start + delay - 1;
+        CHECK(!ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+        ++clock_ms;
+        CHECK(ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+        clock_ms = start + 599999;
+        CHECK(ws_service_preconnect_valid());
+        ++clock_ms;
+        CHECK(!ws_service_preconnect_valid());
+        state = WS_STATE_ACTIVATING;
+        CHECK(!ws_service_preconnect_refresh_due());
+    }
+    CHECK(staggered);
+
+    reset();
+    state = WS_STATE_PREAUTHING;
+    uint32_t received_at = clock_ms;
+    control("{\"type\":\"__preconnect_ready__\",\"expires_in\":1}");
+    CHECK(!ws_service_preconnect_refresh_due());
+    uint32_t short_delay = preconnect_refresh_ms - received_at;
+    CHECK(short_delay > 0 && short_delay < 1000);
+    clock_ms += short_delay;
+    CHECK(ws_service_preconnect_refresh_due() && ws_service_preconnect_valid());
+}
 static void framing_checks(void)
 {
     reset(); state=WS_STATE_AUTHING;
@@ -372,7 +412,7 @@ static void framing_checks(void)
 int main(void)
 {
     continuous_checks(); session_checks(); speech_checks(); speech_fast_path_checks();
-    reminder_checks(); preconnect_checks(); framing_checks(); reset();
+    reminder_checks(); preconnect_checks(); preconnect_refresh_checks(); framing_checks(); reset();
     event_t ev;
     bus_full=delay_control=true;
     publish(EV_WS_CONNECTED,generation);
