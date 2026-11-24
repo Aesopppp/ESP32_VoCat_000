@@ -206,6 +206,22 @@ static void handshake_checks(unsigned frames)
     CHECK(!queued && live_queued==16);
     for(unsigned i=1;i<=16;++i) { int16_t output[512]; uint32_t sample_end=0; wake_word_read_audio(output,sizeof(output),&sample_end); wake_word_confirm_audio_sent(sample_end); }
 }
+static void live_backlog_switch_checks(void)
+{
+    reset(); push_frame(900,false); push_frame(901,true);
+    current=APP_STATE_WS_CONNECTING_WAKE;
+    for(unsigned i=1;i<=32;++i) push_frame((int16_t)i,false);
+    CHECK(wake_word_prepare_pre_roll_upload());
+    current=APP_STATE_PLAYING;
+    for(unsigned i=33;i<=WAKE_WORD_LIVE_RB_ITEM_COUNT+34;++i)
+        push_frame((int16_t)i,false);
+    CHECK(s_live_buffer_active);
+    CHECK(s_pre_roll_dropped_frames > 0 && s_pre_roll_dropped_older_frames > 0);
+    int16_t output[512]; uint32_t sample_end=0;
+    CHECK(wake_word_read_audio(output,sizeof(output),&sample_end)==sizeof(output));
+    CHECK(output[0]==35);
+    CHECK(live_queued==15);
+}
 static void boundary_and_cancel_checks(void)
 {
     reset(); current=APP_STATE_PLAYING;
@@ -269,6 +285,7 @@ int main(void)
     transmit_boundary_checks();
     handshake_checks(63);
     handshake_checks(157);
+    live_backlog_switch_checks();
     boundary_and_cancel_checks();
     overflow_checks();
 #else

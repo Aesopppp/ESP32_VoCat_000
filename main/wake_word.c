@@ -150,14 +150,25 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
     uint32_t replay_samples = 0;
     uint32_t live_samples = 0;
     uint32_t skipped_samples = 0;
-    if (s_pre_roll_replay_sealed && !s_live_buffer_active &&
-        audio_buffer_frames_locked(s_ringbuf) == 0) {
+    if (s_pre_roll_replay_sealed && !s_live_buffer_active) {
+        uint32_t live_pending = s_audio_progress.written_end > s_live_read_end ?
+                                s_audio_progress.written_end - s_live_read_end : 0;
+        uint32_t backlog_limit = BSP_I2S_SAMPLE_RATE / 1000u * (AUDIO_UPLOAD_FIFO_MS / 2u);
+        bool live_backed_up = live_pending >= backlog_limit;
+        if (live_backed_up || audio_buffer_frames_locked(s_ringbuf) == 0) {
         /* 上一帧已交给同一个编码任务，半个 Opus 帧和 TX 队列仍保持顺序。
-         * 只跳过 live FIFO 已淘汰的旧帧，不丢首句，不等待 TX/平台确认。 */
+         * live 积压超过半窗时丢弃尚未补传的旧 pre-roll，优先当前话音；
+         * 只跳过 live FIFO 已淘汰的旧帧，不等待 TX/平台确认。 */
+            if (live_backed_up) {
+                while (discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end)) {
+                    ++s_pre_roll_dropped_frames;
+                    ++s_pre_roll_dropped_older_frames;
+                }
+            }
         uint32_t replay_end = s_pre_roll_replay_end;
         uint32_t live_start = s_live_read_end;
-        replay_samples = replay_end > s_wake_boundary_sample ?
-                         replay_end - s_wake_boundary_sample : 0;
+        replay_samples = s_audio_progress.read_end > s_wake_boundary_sample ?
+                         s_audio_progress.read_end - s_wake_boundary_sample : 0;
         s_audio_progress.read_end = live_start;
         skipped_samples = live_start > replay_end ? live_start - replay_end : 0;
         live_samples = s_audio_progress.written_end - s_live_read_end;
@@ -165,6 +176,7 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
         s_pre_roll_enabled = s_pre_roll_uploading = false;
         switched = true;
         replay_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        }
     }
     RingbufHandle_t ringbuf = s_live_buffer_active ? s_live_ringbuf : s_ringbuf;
     size_t bytes = 0;
@@ -222,9 +234,6 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
         return;
     }
     app_state_t current = app_state_get();
-    if (s_pre_roll_enabled && current == APP_STATE_WAIT_WAKE) {
-        s_audio_progress.written_end += s_fetch_chunksize;
-    }
     bool pre_roll = s_pre_roll_enabled &&
         (current == APP_STATE_WAIT_WAKE || current == APP_STATE_WS_CONNECTING_WAKE ||
          current == APP_STATE_WS_CONNECTED);
@@ -248,6 +257,21 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
             ++dropped;
         }
         if (s_live_buffer_active) s_audio_progress.read_end = s_live_read_end;
+        if (live_tail && s_pre_roll_replay_sealed && !s_live_buffer_active) {
+            uint32_t live_pending = s_audio_progress.written_end > s_live_read_end ?
+                                    s_audio_progress.written_end - s_live_read_end : 0;
+            if (live_pending >= BSP_I2S_SAMPLE_RATE / 1000u * (AUDIO_UPLOAD_FIFO_MS / 2u)) {
+                while (discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end)) {
+                    ++s_pre_roll_dropped_frames;
+                    ++s_pre_roll_dropped_older_frames;
+                }
+                s_pre_roll_replay_end = s_audio_progress.read_end;
+                s_live_read_end = s_audio_progress.written_end;
+                s_live_buffer_active = true;
+                s_pre_roll_enabled = s_pre_roll_uploading = false;
+                ESP_LOGW(TAG, "Pre-roll replay aborted: live FIFO backlog; keeping current speech");
+            }
+        }
     } else if (s_pre_roll_enabled) {
         const uint32_t cap_ms = WAKE_WORD_PRE_ROLL_MAX_MS < WAKE_WORD_REPLAY_CAP_MS ?
                                 WAKE_WORD_PRE_ROLL_MAX_MS : WAKE_WORD_REPLAY_CAP_MS;
