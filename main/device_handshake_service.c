@@ -147,7 +147,7 @@ static bool http_begin(void *context, const char *url, const device_handshake_he
         .buffer_size_tx = 1024,
 #ifdef DEVICE_PLATFORM_TLS_CA
         .crt_bundle_attach = NULL,
-        .ca_cert = tls_trust_anchor_ca_pem(),
+        .cert_pem = tls_trust_anchor_ca_pem(),
 #else
         .crt_bundle_attach = esp_crt_bundle_attach,
 #endif
