@@ -18,7 +18,7 @@ static uint32_t rx_packet_sequence, speech_sequence;
 static bool speech_sequence_seen;
 static size_t rx_bytes;
 static int state=WS_STATE_CONNECTED, decoded_samples=960, opcode;
-static bool client_started, stop_flag, inject_disconnect, queue_fail;
+static bool client_started, stop_flag, inject_disconnect, queue_fail, preconnect_auth_sent;
 static uint8_t *frame;
 static size_t frame_size, received;
 static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
@@ -41,7 +41,7 @@ enum { WEBSOCKET_EVENT_BEFORE_CONNECT, WEBSOCKET_EVENT_CONNECTED,
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 static void publish(app_event_id_t id,uint32_t gen)
 { CHECK(gen==generation); ++events[id]; }
-#define current(p) ((p)->generation==generation && (state==WS_STATE_CONNECTED || state==WS_STATE_AUTHING))
+#define current(p) ((p)->generation==generation && (state==WS_STATE_CONNECTED || state==WS_STATE_AUTHING || state==WS_STATE_PRECONNECTED))
 BaseType_t xSemaphoreTake(SemaphoreHandle_t s,TickType_t ticks) { (void)s; (void)ticks; return pdTRUE; }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return pdTRUE; }
 UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) { (void)q; return queued; }
@@ -52,6 +52,8 @@ static void log_transport_error(const char *phase,const void *event) { CHECK(pha
 static bool audio_out_stop_requested(void) { return stop_flag; }
 static void audio_out_set_streaming(bool active) { CHECK(active); ++started; }
 static void latency_log_event(const char *event, uint32_t ms)
+{ CHECK(event!=NULL); (void)ms; }
+static void latency_log_standby_event(const char *event, uint32_t ms)
 { CHECK(event!=NULL); (void)ms; }
 static int audio_out_play_opus(const uint8_t *data,size_t len)
 {

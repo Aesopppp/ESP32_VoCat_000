@@ -36,7 +36,7 @@ extern "C" {
 
 /* 改为 0 即恢复旧行为：建连期间不缓存，鉴权后只上传实时语音。 */
 #ifndef WAKE_WORD_CONNECT_PRE_ROLL_ENABLED
-#define WAKE_WORD_CONNECT_PRE_ROLL_ENABLED 1
+#define WAKE_WORD_CONNECT_PRE_ROLL_ENABLED 0
 #endif
 
 /* 鉴权封存时保留的预录音目标上限；默认 6 秒，硬上限 8 秒。

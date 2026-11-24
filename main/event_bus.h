@@ -30,6 +30,7 @@ typedef enum {
     EV_WS_SERVER_ERROR      = 7,
     EV_WS_RESPONSE_INTERRUPTED       = 8,
     EV_WS_AUTH_FAILED       = 9, /* 鉴权拒绝单独处理，避免用同一失效 key 无限重连。 */
+    EV_WS_PRECONNECT_READY  = 45, /* D3: 待机轻量鉴权完成，仅保活，不建会话。 */
     EV_WS_SPEECH_STARTED    = 40,
     EV_WS_SPEECH_STOPPED    = 41,
     EV_WS_RESPONSE_DONE     = 42,

@@ -304,6 +304,15 @@ static void builder_checks(void)
     CHECK(!proto_build_auth_frame(buffer, sizeof(buffer), ""));
     CHECK(!proto_build_auth_frame(buffer, sizeof(buffer), NULL));
     CHECK(!proto_build_auth_frame(NULL, sizeof(buffer), "test"));
+    size_t preconnect_length = proto_build_preconnect_auth_frame(buffer, sizeof(buffer), "device-token");
+    CHECK(preconnect_length == strlen(buffer) && preconnect_length > 0);
+    cJSON *preconnect = cJSON_Parse(buffer); CHECK(preconnect != NULL);
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(preconnect, "type")->valuestring, "auth"));
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(preconnect, "token")->valuestring, "device-token"));
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(preconnect, "preconnect")));
+    cJSON_Delete(preconnect);
+    CHECK(proto_parse_json("{\"type\":\"__preconnect_ready__\", \"expires_in\":600}", &msg) == PROTO_OK);
+    CHECK(msg.evt == PROTO_EVT_PRECONNECT_READY);
     char reminder_buffer[PROTO_REMINDER_AUTH_FRAME_SIZE];
     const char *task_ids[] = { "42", "43" };
     size_t reminder_length = proto_build_reminder_auth_frame(reminder_buffer,
@@ -359,6 +368,14 @@ static void connection_checks(void)
     cJSON *json = cJSON_Parse(sent); CHECK(json != NULL);
     CHECK(strcmp(cJSON_GetObjectItemCaseSensitive(json, "token")->valuestring, "device-test-only") == 0);
     cJSON_Delete(json);
+    state = WS_STATE_AUTHING; CHECK(ws_service_preconnect() == ESP_OK);
+    cJSON *preconnect_frame = cJSON_Parse(sent); CHECK(preconnect_frame != NULL);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(preconnect_frame, "preconnect")));
+    cJSON_Delete(preconnect_frame);
+    state = WS_STATE_PRECONNECTED; CHECK(ws_service_activate_preconnect() == ESP_OK);
+    cJSON *activated = cJSON_Parse(sent); CHECK(activated != NULL);
+    CHECK(!cJSON_GetObjectItemCaseSensitive(activated, "preconnect"));
+    cJSON_Delete(activated);
     CHECK(ws_service_set_credentials("wss://other.example", "x") == ESP_ERR_INVALID_STATE);
     fresh(); s_disabled = true; retry_voice_connection(test_now);
     CHECK(connects == 1 && !credentials_from_handshake && strcmp(credentials->token, "legacy-test-only") == 0);

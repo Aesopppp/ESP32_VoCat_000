@@ -99,6 +99,8 @@ proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)
      * 不为兼容不同模型强制 response ID、status 或输出数组的结构。 */
     if (strcmp(type, "__proxy_connected__") == 0) {
         msg->evt = PROTO_EVT_PROXY_CONNECTED;
+    } else if (strcmp(type, "__preconnect_ready__") == 0) {
+        msg->evt = PROTO_EVT_PRECONNECT_READY;
     } else if (strcmp(type, "input_audio_buffer.speech_started") == 0 ||
                strcmp(type, "conversation.item.input_audio_transcription.started") == 0) {
         msg->evt = PROTO_EVT_SPEECH_STARTED;
@@ -176,6 +178,17 @@ size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token)
     }
     *out++ = '"'; *out++ = '}'; *out = 0;
     return length;
+}
+
+size_t proto_build_preconnect_auth_frame(char *buf, size_t buf_size, const char *token)
+{
+    size_t length = proto_build_auth_frame(buf, buf_size, token);
+    if (!length) return 0;
+    static const char suffix[] = ",\"preconnect\":true}";
+    size_t needed = length - 1 + sizeof(suffix) - 1;
+    if (buf_size <= needed) { buf[0] = 0; return 0; }
+    memcpy(buf + length - 1, suffix, sizeof(suffix));
+    return needed - 1;
 }
 
 static bool reminder_task_id_valid(const char *id)
@@ -263,6 +276,7 @@ const char *proto_event_name(proto_event_t evt)
 {
     switch (evt) {
         case PROTO_EVT_PROXY_CONNECTED: return "PROXY_CONNECTED";
+        case PROTO_EVT_PRECONNECT_READY: return "PRECONNECT_READY";
         case PROTO_EVT_ERROR:           return "ERROR";
         case PROTO_EVT_SPEECH_STARTED:  return "SPEECH_STARTED";
         case PROTO_EVT_SPEECH_STOPPED:  return "SPEECH_STOPPED";

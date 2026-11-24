@@ -27,6 +27,7 @@ static esp_websocket_client_handle_t client;
 static atomic_int state = WS_STATE_DISCONNECTED;
 static atomic_uint generation = 1;
 static bool client_started;
+static bool preconnect_auth_sent;
 static proto_ws_credentials_t *credentials; /* 主任务设置；RX 仅在 playback_lock 下读取。 */
 static bool credentials_from_handshake;
 static char prepared_url[PROTO_WS_URL_MAX + 1];
@@ -287,9 +288,16 @@ static void handle_frame(const rx_frame_t *packet)
         state = WS_STATE_CONNECTED;
         latency_log_event("proxy-connected", packet->received_ms);
         publish(EV_WS_AUTH_OK, packet->generation);
+    } else if (msg.evt == PROTO_EVT_PRECONNECT_READY &&
+               (state == WS_STATE_AUTHING || state == WS_STATE_PRECONNECTED) && preconnect_auth_sent) {
+        preconnect_auth_sent = false;
+        state = WS_STATE_PRECONNECTED;
+        latency_log_standby_event("preconnect-ready", packet->received_ms);
+        publish(EV_WS_PRECONNECT_READY, packet->generation);
     } else if (msg.evt == PROTO_EVT_ERROR) {
         log_server_error(&msg);
-        bool auth_failed = state == WS_STATE_AUTHING || proto_is_auth_error(&msg);
+        bool auth_failed = state == WS_STATE_AUTHING || preconnect_auth_sent ||
+                           proto_is_auth_error(&msg);
         state = WS_STATE_ERROR;
         reset_speech_status();
         publish(auth_failed ? EV_WS_AUTH_FAILED : EV_WS_SERVER_ERROR, packet->generation);
@@ -338,18 +346,21 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         latency_log_event("ws-before-tcp-connect", (uint32_t)(esp_timer_get_time() / 1000));
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
         state = WS_STATE_AUTHING;
+        preconnect_auth_sent = false;
         reset_speech_status();
         log_connection_memory("connected");
         latency_log_event("ws-transport-connected", (uint32_t)(esp_timer_get_time() / 1000));
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
         state = WS_STATE_DISCONNECTED;
+        preconnect_auth_sent = false;
         reset_speech_status();
         log_transport_error("disconnected", event);
         release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
         publish(EV_WS_DISCONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
         state = WS_STATE_ERROR;
+        preconnect_auth_sent = false;
         reset_speech_status();
         log_transport_error("error", event);
         log_connection_memory("transport-error");
@@ -579,6 +590,7 @@ esp_err_t ws_service_connect(void)
     if (!client || !credentials) return ESP_ERR_INVALID_STATE;
     if (client_started) return ESP_OK;
     state = WS_STATE_CONNECTING;
+    preconnect_auth_sent = false;
     reset_speech_status();
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
@@ -591,6 +603,7 @@ esp_err_t ws_service_connect(void)
 esp_err_t ws_service_authenticate(void)
 {
     if (!client || !credentials || state != WS_STATE_AUTHING) return ESP_ERR_INVALID_STATE;
+    if (preconnect_auth_sent) return ESP_ERR_INVALID_STATE;
     const char *token = credentials->token;
     log_auth_token_fingerprint(token, credentials_from_handshake ?
                               "HTTP/handshake/websocket.token" : "NVS/korvo_cfg/acos_token");
@@ -612,11 +625,41 @@ esp_err_t ws_service_authenticate(void)
     free(auth);
     return err;
 }
+
+esp_err_t ws_service_preconnect(void)
+{
+    if (!client || !credentials || state != WS_STATE_AUTHING || reminder_task_count)
+        return ESP_ERR_INVALID_STATE;
+    if (preconnect_auth_sent) return ESP_ERR_INVALID_STATE;
+    const char *token = credentials->token;
+    log_auth_token_fingerprint(token, credentials_from_handshake ?
+                              "HTTP/handshake/websocket.token" : "NVS/korvo_cfg/acos_token");
+    size_t capacity = strlen(token) * 6 + 48;
+    char *auth = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!auth) return ESP_ERR_NO_MEM;
+    size_t len = proto_build_preconnect_auth_frame(auth, capacity, token);
+    esp_err_t err = len && esp_websocket_client_send_text(client, auth, len, pdMS_TO_TICKS(1000)) == (int)len
+                    ? ESP_OK : ESP_FAIL;
+    if (err == ESP_OK) preconnect_auth_sent = true;
+    volatile char *wipe = auth;
+    for (size_t i = 0; i < capacity; ++i) wipe[i] = 0;
+    free(auth);
+    return err;
+}
+
+esp_err_t ws_service_activate_preconnect(void)
+{
+    if (!client || !credentials || state != WS_STATE_PRECONNECTED) return ESP_ERR_INVALID_STATE;
+    state = WS_STATE_AUTHING;
+    preconnect_auth_sent = false;
+    return ws_service_authenticate();
+}
 esp_err_t ws_service_disconnect(void)
 {
     if (!client) return ESP_ERR_INVALID_STATE;
     bool was_started = client_started;
     state = WS_STATE_DISCONNECTED;
+    preconnect_auth_sent = false;
     reset_speech_status();
     /* 先解除 worker 的 PCM 背压，再等待 transport/播放器锁，避免关闭互等。 */
     audio_out_request_stop();
@@ -631,6 +674,7 @@ esp_err_t ws_service_disconnect(void)
     atomic_fetch_add(&generation, 1);
     xSemaphoreTake(playback_lock, portMAX_DELAY);
     state = WS_STATE_DISCONNECTED;
+    preconnect_auth_sent = false;
     reminder_device_id[0] = 0;
     memset(reminder_task_ids, 0, sizeof(reminder_task_ids));
     reminder_task_count = 0;

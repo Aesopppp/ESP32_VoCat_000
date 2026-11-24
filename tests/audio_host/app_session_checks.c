@@ -73,11 +73,12 @@ static void led_set_connecting(void) {}
 static void latency_log_begin(uint32_t ms, uint32_t seed) { (void)ms; (void)seed; }
 static void latency_log_event(const char *event, uint32_t ms) { CHECK(event!=NULL); (void)ms; }
 static void latency_log_mark_upload_phase(void) {}
+static void latency_log_standby_event(const char *event, uint32_t ms) { CHECK(event!=NULL); (void)ms; }
 esp_err_t app_state_start_listening(void)
 {
     ++starts;
     if(upload_result!=ESP_OK) return upload_result;
-    CHECK(ws_state==WS_STATE_CONNECTED);
+    CHECK(ws_state==WS_STATE_CONNECTED || ws_state==WS_STATE_PRECONNECTED);
     current_state=APP_STATE_LISTENING; upload.running=true; return ESP_OK;
 }
 esp_err_t app_state_back_to_wait_wake(void)

@@ -1,5 +1,13 @@
-# 唤醒首句补传与实时上传
-唤醒建连期间继续保留麦克风 PCM。鉴权成功后封存当时已保留的预录音，按原顺序全部补传，再切换到实时音频；超过缓存上限时只淘汰最旧帧并显式统计。
+# 唤醒首句补传与实时上传（D3 降级路径）
+D3 已成为主链路：Wi-Fi 成功后建立 WebSocket 长连接并发送 `preconnect=true` 轻量鉴权；唤醒后在同一连接上发送普通 `auth`，收到 `__proxy_connected__` 后直接上传实时音频。pre-roll 默认关闭，仅在 D3 预连接失效且必须回退到唤醒后建连时作为降级能力保留。
+
+## D3 设备时序
+1. Wi-Fi / HTTP handshake 拿到 `websocket.url` 与 `websocket.token` 后，主任务设置凭据并立即连接 WSS。
+2. WS transport connected 后发送首帧 `{"type":"auth","token":"...","preconnect":true}`；网关回 `__preconnect_ready__`，设备进入待机保活，不建房、不拉 agent、不落话单。
+3. WakeNet / 触摸 / 提醒触发会话时，若连接仍处于 `WS_STATE_PRECONNECTED`，同一 WS 上再发普通 `auth`，进入既有 `__proxy_connected__` 流程。
+4. `__proxy_connected__` 后启动实时全双工上传；D3 主链路不回放 pre-roll。
+
+关键日志：`D3 standby WebSocket started`、`D3 WebSocket preconnected; waiting for wake`、`Activating D3 preconnected WebSocket`。
 ## 数据流
 1. WakeNet 命中帧及其之前的音频不上传，其后的 PCM 写入大 FIFO。默认目标保留 6000ms，硬上限 8000ms（受 320 帧、约 10.24 秒容量约束）；超过上限时丢弃最旧帧，优先保住最近话音。
 2. WakeNet 命中后到鉴权成功前，PCM 持续写入预录音缓存；鉴权前不会提前切到 live，也不会因本地 VAD 判断而截断用户连续讲话。
