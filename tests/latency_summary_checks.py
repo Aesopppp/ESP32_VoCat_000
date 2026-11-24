@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.latency_summary import load_latency_log, summarize
+from scripts.latency_summary import load_latency_log, percentile, summarize, summarize_batch
 
 
 LOG_LINE = re.compile(
@@ -157,6 +157,69 @@ class LatencySummaryChecks(unittest.TestCase):
         json.dumps(summary, ensure_ascii=False)
         self.assertEqual(summary["room"], "")
 
+    def test_percentile_uses_nearest_rank(self):
+        self.assertEqual(percentile([5, 1, 3, 2, 4], 0.95), 5)
+        self.assertEqual(percentile([1, 2, 3, 4], 0.5), 2)
+        self.assertEqual(percentile([], 0.95), 0)
+
+    def test_summarize_batch_reports_p95_and_manual_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.log"
+            second = Path(directory) / "second.log"
+            first.write_text(timeline([
+                ("wake-requested", 1000),
+                ("ws-before-tcp-connect", 1100),
+                ("ws-transport-connected", 2000),
+                ("ws-tls-and-handshake-done", 2010),
+                ("proxy-connected", 2200),
+                ("audio-upload-ready", 2200),
+                ("first-live-uplink", 2600),
+                ("speech-stopped", 3000),
+                ("agent-first-audio", 3500),
+            ], session="wake-1", room="gw-1"), encoding="utf-8")
+            second.write_text(timeline([
+                ("wake-requested", 5000),
+                ("ws-before-tcp-connect", 5100),
+                ("ws-transport-connected", 7000),
+                ("ws-tls-and-handshake-done", 7010),
+                ("proxy-connected", 7200),
+                ("audio-upload-ready", 7200),
+                ("first-live-uplink", 7800),
+                ("speech-stopped", 8000),
+                ("agent-first-audio", 8600),
+            ], session="wake-2", room="gw-2"), encoding="utf-8")
+            result = summarize_batch([first, second])
+        self.assertEqual(result["session_count"], 2)
+        self.assertEqual(result["p95_ms"]["wake_to_ws_transport_connected"], 2000)
+        self.assertEqual(result["p95_ms"]["auth_to_first_live_uplink"], 600)
+        self.assertEqual(result["p95_ms"]["speech_stopped_to_agent_first_audio"], 600)
+        self.assertEqual(result["max_ms"]["wake_to_ws_transport_connected"], 2000)
+        self.assertTrue(any("本地反馈" in item for item in result["manual_checks"]))
+        self.assertTrue(any("6 秒预录音窗口" in item for item in result["manual_checks"]))
+        self.assertTrue(any("待机功耗" in item for item in result["manual_checks"]))
+
+    def test_summarize_batch_rejects_insufficient_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "one.log"
+            path.write_text(timeline([
+                ("wake-requested", 100),
+                ("ws-before-tcp-connect", 110),
+                ("ws-transport-connected", 200),
+                ("ws-tls-and-handshake-done", 200),
+                ("proxy-connected", 220),
+                ("audio-upload-ready", 225),
+                ("first-live-uplink", 250),
+                ("speech-stopped", 300),
+                ("agent-first-audio", 350),
+            ], session="wake-one", room=None), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "at least 2"):
+                summarize_batch([path], minimum_sessions=2)
+
+    def test_summarize_batch_rejects_zero_minimum(self):
+        with self.assertRaisesRegex(ValueError, "minimum_sessions must be positive"):
+            summarize_batch([], minimum_sessions=0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

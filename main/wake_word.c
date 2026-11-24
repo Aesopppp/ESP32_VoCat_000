@@ -44,7 +44,7 @@ static wake_word_mode_t         s_mode          = WAKE_WORD_MODE_WAKE;
 
 /** ring buffer 句柄（detect_Task → audio_in） */
 static RingbufHandle_t  s_ringbuf = NULL;
-/* 首句闭合后滚动保存实时 PCM；大 FIFO 冻结直到唯一读取端读完。 */
+/* 鉴权后滚动保存实时 PCM；补传 FIFO 冻结直到唯一读取端读完。 */
 static RingbufHandle_t  s_live_ringbuf = NULL;
 
 /** feed/detect 任务句柄 */
@@ -76,12 +76,13 @@ static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；会话内�
 static bool s_pre_roll_enabled = false; /* 与 FIFO 一起由 s_audio_buffer_lock 保护。 */
 static bool s_pre_roll_uploading;
 static bool s_pre_roll_replay_sealed;
-static bool s_first_phrase_speech_seen, s_first_phrase_closed, s_live_buffer_active;
-static uint32_t s_first_phrase_silence_samples, s_first_phrase_end, s_live_read_end;
+static bool s_live_buffer_active;
+static uint32_t s_live_read_end;
 static uint32_t s_pre_roll_replay_end;
 static uint32_t s_wake_boundary_sample = 0;
 static uint32_t s_afe_sample_end; /* 每个有效 fetch 帧推进，包括待机；不随 FIFO 清空复位。 */
 static uint32_t s_pre_roll_dropped_frames;
+static uint32_t s_pre_roll_dropped_older_frames;
 static wake_word_audio_progress_t s_audio_progress;
 static uint32_t s_overflow_log_ms;
 static uint32_t s_overflow_frames; /* 限频日志之间累计，不能只报最后一次丢帧。 */
@@ -124,45 +125,10 @@ static void clear_audio_buffer_locked(void)
     s_overflow_frames = 0;
     s_pre_roll_enabled = s_pre_roll_uploading = false;
     s_pre_roll_replay_sealed = false;
-    s_first_phrase_speech_seen = s_first_phrase_closed = s_live_buffer_active = false;
-    s_first_phrase_silence_samples = s_first_phrase_end = s_live_read_end = 0;
+    s_live_buffer_active = false;
+    s_live_read_end = 0;
     s_pre_roll_replay_end = 0;
-    s_wake_boundary_sample = s_pre_roll_dropped_frames = 0;
-}
-
-/* 新 LITE AFE 不继承 WAKE AFE 的 VAD 状态；只复位检测器，不动已缓存 PCM。
- * 闭合的首句边界是只读的，不能被重复模式通知重新打开。调用方持缓存锁。 */
-static void reset_first_phrase_detector_locked(void)
-{
-    if (s_first_phrase_closed) return;
-    s_first_phrase_speech_seen = false;
-    s_first_phrase_silence_samples = 0;
-}
-
-static bool observe_first_phrase_locked(int vad_state, bool valid_voice, bool lite_source)
-{
-    /* 唤醒词的 SPEECH 尾状态不算第一句话。WAKE 模式仍完整缓存 PCM；
-     * 等真正切入 LITE 后才使用该 AFE 自己的 VAD 来划分首句。 */
-    if (!WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED || !s_pre_roll_enabled ||
-        s_first_phrase_closed || !s_live_ringbuf || s_mode != WAKE_WORD_MODE_LITE || !lite_source)
-        return false;
-    if (vad_state == VAD_SPEECH) {
-        if (valid_voice) s_first_phrase_speech_seen = true;
-        /* 弱音也中止静音累计；宁可多留历史，不用低能量误切正常句子。 */
-        s_first_phrase_silence_samples = 0;
-    } else if (vad_state == VAD_SILENCE && s_first_phrase_speech_seen) {
-        s_first_phrase_silence_samples += s_fetch_chunksize;
-        if (s_first_phrase_silence_samples >=
-            BSP_I2S_SAMPLE_RATE / 1000u * WAKE_WORD_FIRST_PHRASE_SILENCE_MS) {
-            /* 包含已存入的句尾静音；首句满队列时缺失帧已计入 dropped_new。
-             * 这里只分段补传缓存，不判断语义、控制播放或发送 cancel。 */
-            s_first_phrase_closed = true;
-            s_first_phrase_end = s_audio_progress.written_end;
-            s_live_read_end = s_first_phrase_end;
-            return true;
-        }
-    }
-    return false;
+    s_wake_boundary_sample = s_pre_roll_dropped_frames = s_pre_roll_dropped_older_frames = 0;
 }
 
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress)
@@ -230,12 +196,10 @@ void wake_word_confirm_audio_sent(uint32_t sample_end)
     bool caught_up = false;
     uint32_t pending_samples = 0, dropped = 0;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    /* 首句尚未闭合时保留提前追近实时的路径。闭合后由读取端切源，
-     * 不让迟到的发送确认打乱两个 FIFO 的边界。生命周期切换仍须先
-     * 停止两个上传任务再清 FIFO，禁止旧连接确认影响新连接。 */
+    /* 补传未封存时保留提前追近实时的路径；封存后由读取端切源。
+     * 生命周期切换仍须先停止两个上传任务再清 FIFO，禁止旧连接确认影响新连接。 */
     pending_samples = s_audio_progress.written_end - sample_end;
     if (s_pre_roll_enabled && s_pre_roll_uploading && !s_pre_roll_replay_sealed &&
-        !s_first_phrase_closed &&
         pending_samples <= BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) {
         s_pre_roll_enabled = s_pre_roll_uploading = false;
         dropped = s_pre_roll_dropped_frames;
@@ -249,7 +213,8 @@ void wake_word_confirm_audio_sent(uint32_t sample_end)
 }
 
 /* WakeNet 判定帧本身不上传；其后 PCM 在建连/补传期间受保护。普通连续
- * 上传仍只保留 512 ms。预录音满时丢新帧保首句，诊断明确报告这段缺失。 */
+ * 上传仍只保留 512 ms。唤醒后的 PCM 先进入有界 ring buffer，超过上限时
+ * 淘汰最旧帧，保证鉴权后补传保留最近的用户话音。 */
 static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, bool lite_source)
 {
     if (!s_ringbuf || !res->data || res->data_size <= 0) return;
@@ -262,8 +227,7 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     s_afe_sample_end += s_fetch_chunksize;
     if (WAKE_WORD_CONNECT_PRE_ROLL_ENABLED && wake_detected && s_audio_buffer_enabled) {
-        /* 同一锁内裁掉判定帧及其之前的声音，再允许后续帧入队；先于发布
-         * 唤醒事件，故主任务尚未处理事件的 WAIT_WAKE 短窗口也不会丢句首。 */
+        /* WakeNet 判定帧本身不上传，只从判定帧末端开始建立本次预录音。 */
         clear_audio_buffer_locked();
         s_wake_boundary_sample = s_afe_sample_end;
         s_audio_progress.written_end = s_audio_progress.read_end = s_wake_boundary_sample;
@@ -272,6 +236,9 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
         return;
     }
     app_state_t current = app_state_get();
+    if (s_pre_roll_enabled && current == APP_STATE_WAIT_WAKE) {
+        s_audio_progress.written_end += s_fetch_chunksize;
+    }
     bool pre_roll = s_pre_roll_enabled &&
         (current == APP_STATE_WAIT_WAKE || current == APP_STATE_WS_CONNECTING_WAKE ||
          current == APP_STATE_WS_CONNECTED);
@@ -282,7 +249,7 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
     }
     size_t dropped = 0;
     bool stored = false;
-    bool live_tail = s_first_phrase_closed || s_pre_roll_replay_sealed;
+    bool live_tail = s_pre_roll_replay_sealed;
     RingbufHandle_t ringbuf = live_tail ? s_live_ringbuf : s_ringbuf;
     uint32_t *read_end = live_tail ? &s_live_read_end : &s_audio_progress.read_end;
     if (live_tail) {
@@ -296,14 +263,24 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
         }
         if (s_live_buffer_active) s_audio_progress.read_end = s_live_read_end;
     } else if (s_pre_roll_enabled) {
-        if (audio_buffer_frames_locked(s_ringbuf) < WAKE_WORD_RB_ITEM_COUNT)
-            stored = xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) == pdTRUE;
-        if (!stored) {
+        const uint32_t cap_ms = WAKE_WORD_PRE_ROLL_MAX_MS < WAKE_WORD_REPLAY_CAP_MS ?
+                                WAKE_WORD_PRE_ROLL_MAX_MS : WAKE_WORD_REPLAY_CAP_MS;
+        const size_t max_frames = (BSP_I2S_SAMPLE_RATE / 1000u * cap_ms) / s_fetch_chunksize;
+        while (audio_buffer_frames_locked(s_ringbuf) >= max_frames &&
+               discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end)) {
+            ++s_pre_roll_dropped_older_frames;
             ++s_pre_roll_dropped_frames;
+        }
+        while (!(stored = xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) == pdTRUE)) {
+            if (!discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end)) break;
+            ++s_pre_roll_dropped_older_frames;
+            ++s_pre_roll_dropped_frames;
+        }
+        if (!stored) {
             uint32_t now = esp_log_timestamp();
             if ((uint32_t)(now - s_overflow_log_ms) >= 2000) {
                 s_overflow_log_ms = now;
-                ESP_LOGW(TAG, "Pre-roll FIFO full: discarded %lu new frames (%lu ms); first phrase retained",
+                ESP_LOGW(TAG, "Pre-roll FIFO full: discarded %lu old frames (%lu ms)",
                          (unsigned long)s_pre_roll_dropped_frames,
                          (unsigned long)(s_pre_roll_dropped_frames * s_fetch_chunksize /
                                          (BSP_I2S_SAMPLE_RATE / 1000u)));
@@ -330,8 +307,6 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
             s_audio_progress.last_voice_ms=voice_ms ? voice_ms : UINT32_MAX;
         }
     }
-    bool first_phrase_closed_now = observe_first_phrase_locked(res->vad_state, valid_voice, lite_source);
-    uint32_t phrase_end_snapshot = s_first_phrase_end;
     s_overflow_frames += dropped;
     uint32_t now = esp_log_timestamp(), report_dropped = 0;
     if (s_overflow_frames && (uint32_t)(now - s_overflow_log_ms) >= 2000) {
@@ -340,9 +315,6 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
         s_overflow_frames = 0;
     }
     xSemaphoreGive(s_audio_buffer_lock);
-    if (first_phrase_closed_now)
-        ESP_LOGI(TAG, "First phrase boundary captured; later audio uses live FIFO (end_sample=%lu)",
-                 (unsigned long)phrase_end_snapshot);
     if (report_dropped)
         ESP_LOGW(TAG, "Microphone FIFO behind: discarded %lu old frames (%lu ms) since last report; keeping live audio",
                  (unsigned long)report_dropped,
@@ -625,13 +597,12 @@ esp_err_t wake_word_init(void)
     /* ── 6. 创建 ring buffer ─────────────────────────────── */
     s_ringbuf = xRingbufferCreateWithCaps(WAKE_WORD_RB_TOTAL_SIZE, RINGBUF_TYPE_NOSPLIT,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (WAKE_WORD_CONNECT_PRE_ROLL_ENABLED && WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED)
+    if (WAKE_WORD_CONNECT_PRE_ROLL_ENABLED)
         s_live_ringbuf = xRingbufferCreateWithCaps(WAKE_WORD_LIVE_RB_TOTAL_SIZE,
                             RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_audio_buffer_lock = xSemaphoreCreateMutex();
     if (s_ringbuf == NULL || s_audio_buffer_lock == NULL ||
-        (WAKE_WORD_CONNECT_PRE_ROLL_ENABLED && WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED &&
-         s_live_ringbuf == NULL)) {
+        (WAKE_WORD_CONNECT_PRE_ROLL_ENABLED && s_live_ringbuf == NULL)) {
         ESP_LOGE(TAG, "xRingbufferCreate failed");
         if (s_ringbuf) vRingbufferDeleteWithCaps(s_ringbuf);
         if (s_live_ringbuf) vRingbufferDeleteWithCaps(s_live_ringbuf);
@@ -783,16 +754,9 @@ bool wake_word_prepare_pre_roll_upload(void)
     bool prepared = s_pre_roll_enabled;
     if (prepared && !s_pre_roll_replay_sealed) {
         s_pre_roll_uploading = true;
-        uint32_t cap_samples = BSP_I2S_SAMPLE_RATE / 1000u * WAKE_WORD_REPLAY_CAP_MS;
-        uint32_t discarded = 0;
-        uint32_t retain_end = s_first_phrase_closed ? s_first_phrase_end : s_audio_progress.written_end;
-        while (retain_end - s_audio_progress.read_end > cap_samples &&
-               discard_oldest_audio_locked(s_ringbuf, &s_audio_progress.read_end))
-            ++discarded;
-        s_pre_roll_replay_end = retain_end;
+        s_pre_roll_replay_end = s_audio_progress.written_end;
         s_pre_roll_replay_sealed = true;
-        if (discarded) s_pre_roll_dropped_frames = discarded;
-        ESP_LOGI(TAG, "Pre-roll upload ready: boundary_sample=%lu buffered_ms=%lu dropped_new=%lu",
+        ESP_LOGI(TAG, "Pre-roll upload ready: boundary_sample=%lu buffered_ms=%lu dropped_ms=%lu",
                  (unsigned long)s_wake_boundary_sample,
                  (unsigned long)((s_audio_progress.written_end - s_audio_progress.read_end) /
                                  (BSP_I2S_SAMPLE_RATE / 1000u)),
@@ -890,12 +854,10 @@ esp_err_t wake_word_set_mode(wake_word_mode_t mode)
 
     s_afe_data = target;
     s_mode = mode;
-    if (mode == WAKE_WORD_MODE_LITE) reset_first_phrase_detector_locked();
-
     /* 普通切换清缓存；唤醒预录音跨 WAKE -> LITE 保留相同16kHz单声道PCM。 */
     if (!s_pre_roll_enabled) clear_audio_buffer_locked();
 
-    /* 保留本次唤醒锁存直到回待机，避免切 LITE 的短窗口重复建立首句边界。 */
+    /* 保留本次唤醒锁存直到回待机，避免切 LITE 的短窗口误清预录音。 */
     if (mode == WAKE_WORD_MODE_WAKE) s_wake_state = WAKE_STATE_IDLE;
 
     if (s_audio_buffer_lock) xSemaphoreGive(s_audio_buffer_lock);

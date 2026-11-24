@@ -18,8 +18,8 @@ YYYY-MM-DDTHH:MM:SS.mmmZ LAT session=<wake-session-id> event=<event> monotonic_m
 | `ws-tls-and-handshake-done` | 主任务收到 WS connected，鉴权开始 |
 | `proxy-connected` | 网关确认代理已连接 |
 | `audio-upload-ready` | 设备可上行音频 |
+| `pre-roll-ready` | 鉴权封存预录音，detail 带 buffered_ms/dropped_ms |
 | `first-live-uplink` | 第一包实时音频成功发送 |
-| `speech-stopped` | 平台判定用户说完 |
 | `agent-first-audio` | 设备收到智能体首段音频/响应事件 |
 | `ws-dns-warmed` | 待机阶段完成 WebSocket 域名预解析（`detail=standby`，不属于唤醒会话） |
 
@@ -42,3 +42,5 @@ python scripts/latency_summary.py <device.log>
 
 ISO 时间来自设备 UTC 时钟；若设备时钟偏差大，可先按网关日志中同一话单的绝对时间校准。
 `monotonic_ms` 是 ESP32 单调时钟，优先用于分段计算，避免设备校时跳变污染耗时。
+
+

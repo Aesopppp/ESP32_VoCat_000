@@ -39,15 +39,10 @@ extern "C" {
 #define WAKE_WORD_CONNECT_PRE_ROLL_ENABLED 1
 #endif
 
-/* 改为 0 保留原来的整段预录音追赶方式；不影响总 pre-roll 开关。 */
-#ifndef WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED
-#define WAKE_WORD_FIRST_PHRASE_HANDOFF_ENABLED 1
-#endif
-/* 仅使用 LITE AFE 的有效人声来开启首句判定；WAKE 的残留 VAD 不算首句。
- * AFE 自身已经做静音持续时间判定；这里只额外容忍短暂无声帧。
- * 此值不是原始麦克风的总句尾等待时间，也不参与平台打断。 */
-#define WAKE_WORD_FIRST_PHRASE_SILENCE_MS 160u
-#define WAKE_WORD_REPLAY_CAP_MS 800u
+/* 鉴权封存时保留的预录音目标上限；默认 6 秒，硬上限 8 秒。
+ * ring buffer 容量不足时保留最近窗口，淘汰最旧帧并记录 dropped_ms。 */
+#define WAKE_WORD_REPLAY_CAP_MS 6000u
+#define WAKE_WORD_PRE_ROLL_MAX_MS 8000u
 #define WAKE_WORD_LIVE_RB_ITEM_COUNT 16u  /* 16 × 32 ms = 512 ms */
 
 /** PSRAM FIFO backing store including per-item headers. Wake-to-connect replay
@@ -123,8 +118,8 @@ void wake_word_deinit(void);
  */
 RingbufHandle_t wake_word_get_ringbuf(void);
 /* FIFO 的逻辑采样位置只用于当前缓存生命周期；清空同步复位，唤醒时以判定
- * 帧末端为起点。丢弃新帧不计入已入队长度。所有访问由缓存锁串行化，不能
- * 持锁等待网络。首句闭合后单独保留最新 live PCM，读取切源时 read_end
+ * 帧末端为起点。超限时淘汰最旧帧并计入 dropped 统计。所有访问由缓存锁串行化，不能
+ * 持锁等待网络。鉴权封存后单独保留最新 live PCM，读取切源时 read_end
  * 跳过已淘汰的旧 live 帧；不会清空编码半包或有序 TX 队列。speech_end 是 AFE 判为人声且能量
  * 达到诊断门限的最后一帧末端，不表示识别出了完整语义。 */
 typedef struct {
@@ -135,13 +130,13 @@ typedef struct {
 } wake_word_audio_progress_t;
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
 /** audio_in 唯一消费者：非阻塞复制一帧并归还项，返回字节数及末端采样位置。
- * 首句结束且已读完时切到最新 live PCM，不等待网络或平台确认；调用者必须
+ * 补传 FIFO 读完且已封存时切到最新 live PCM，不等待网络或平台确认；调用者必须
  * 先处理完上次返回的 PCM 再读下一帧，保留编码半包和 TX FIFO 的顺序。
  * 返回 0 表示无帧；返回值大于 capacity 时未复制，消费者必须报错。 */
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end);
 /** 唯一 TX 消费者在当前连接成功发送后确认采样末端；不持上传锁调用。
- * 首句尚未闭合时，可在确实追到 512 ms 内提前恢复普通 FIFO；闭合后的
- * 首句切源由唯一读取端完成，不依赖此确认，更不等待平台 ACK。
+ * 补传尚未封存时，可在确实追到 512 ms 内提前恢复普通 FIFO；封存后的
+ * 切源由唯一读取端完成，不依赖此确认，更不等待平台 ACK。
  * 切换连接/清 FIFO 前必须等待编码和 TX 任务都退出，禁止确认旧连接采样。 */
 void wake_word_confirm_audio_sent(uint32_t sample_end);
 /** Flush stale PCM with the upload task stopped. */
@@ -154,8 +149,8 @@ void wake_word_set_audio_buffer_enabled(bool enabled);
  *  仅 false 有效；启用只能由 detect_Task 的真实 WakeNet 判定触发。 */
 void wake_word_set_pre_roll(bool enabled);
 
-/** 鉴权后、创建上传任务前调用。true 表示从 WakeNet 判定帧末端起的
- *  PCM 已保留并进入补传保护；首句读完后切实时，或提前追到 512 ms 内恢复。
+/** 鉴权后、创建上传任务前调用。true 表示鉴权前的 retained PCM 已封存，
+ *  audio_in 会按原 FIFO 顺序全部补传，再读取鉴权后写入的 live FIFO。
  *  false 表示无有效预录音，主调继续旧清空行为。不会启停 AFE 或上传任务。 */
 bool wake_word_prepare_pre_roll_upload(void);
 
