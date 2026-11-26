@@ -23,6 +23,7 @@ typedef struct {
 typedef struct {
     int status;       /* 0=网络/资源/读取失败；已收到的永久 HTTP 错误不会被降级为 0。 */
     bool success;
+    int64_t read_ms; /* Time inside transport reads, including EOF and errors. */
     const char *reason; /* 固定字符串，可安全输出日志。 */
     device_handshake_response_t response;
 } device_handshake_result_t;

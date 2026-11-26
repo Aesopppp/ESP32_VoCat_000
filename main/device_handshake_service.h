@@ -8,8 +8,11 @@
  * 接口均由 main_task 串行调用；HTTP I/O 在独立低优先级 worker 内完成。 */
 esp_err_t device_handshake_service_init(void);
 
-/* 非阻塞；network_available 应同时考虑 GOT_IP 和是否处于配网模式。 */
-void device_handshake_service_poll(bool network_available);
+/* 主任务非阻塞。network_available 表示 GOT_IP 且未配网，voice_priority 表示语音占用。
+ * 语音期间只调度建连所需的凭据请求，已在途的 HTTP 仍会收尾并交付结果。 */
+void device_handshake_service_poll(bool network_available, bool voice_priority);
+/* 从请求入队到主任务收到 worker 已释放 HTTP/TLS 的结果。 */
+bool device_handshake_service_busy(void);
 
 /* 显式重读整组配置并解除永久错误；不能在每次 Wi-Fi 重连时调用。
  * 只读 NVS、不写 Flash。供未来安全注入/人工更新入口使用。 */

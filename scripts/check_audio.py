@@ -18,7 +18,8 @@ def main():
     # 直接提取生产函数；主机桩只替换 RTOS、网络和外设依赖。
     source = (root / "main/app_main.c").read_text(encoding="utf-8")
     (output / "app_session.inc").write_text("\n\n".join(extract(source, name) for name in
-        ("release_reminder", "stop_session_audio", "end_conversation", "start_audio_session",
+        ("mqtt_startup_configuration", "release_reminder", "stop_session_audio", "end_conversation",
+         "refresh_rejected_voice_credentials", "start_audio_session",
          "abandon_preconnection", "poll_preconnection", "handle_preconnection_event", "start_conversation",
          "poll_conversation", "handle_talk_action", "tagged_ws_event", "poll_reminder")), encoding="utf-8")
     ws = (root / "main/ws_service.c").read_text(encoding="utf-8")
@@ -35,7 +36,7 @@ def main():
     (output / "ws_upload.inc").write_text(extract(ws, "ws_service_send_opus_frame"), encoding="utf-8")
     wifi = (root / "main/wifi_service.c").read_text(encoding="utf-8")
     (output / "wifi_audio.inc").write_text("\n\n".join(extract(wifi, name) for name in
-        ("apply_audio_power_save_locked", "wifi_service_set_audio_active",
+        ("apply_audio_power_save_locked", "wifi_service_set_audio_active", "wifi_service_set_setup_active",
          "wifi_event_handler")), encoding="utf-8")
     audio = (root / "main/audio_out.c").read_text(encoding="utf-8")
     (output / "audio_stop.inc").write_text("\n\n".join(extract(audio, name) for name in

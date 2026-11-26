@@ -65,6 +65,8 @@ static int xTaskCreatePinnedToCore(void (*fn)(void *),const char *name,int stack
 }
 static void vTaskDelay(int ms) { (void)ms; }
 static int64_t fake_now = 1000;
+enum { WIFI_SETUP_MQTT = 4 };
+static void wifi_service_set_setup_active(int owner, bool active) { (void)owner; (void)active; }
 static int64_t esp_timer_get_time(void) { return fake_now * 1000; }
 static uint32_t esp_random(void) { return 20; }
 static bool wifi_service_get_ip_str(char *p,size_t n) { snprintf(p,n,"192.0.2.1"); return true; }

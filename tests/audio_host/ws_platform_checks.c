@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "../../main/event_bus.h"
 #include "../../main/ws_service.h"
+#include "../../main/wifi_service.h"
+void wifi_service_set_setup_active(wifi_setup_t owner, bool active) { (void)owner; (void)active; }
 #include "../../main/proto_service.h"
 #include "../../main/ws_rx_policy.h"
 #define atomic_fetch_sub(p,v) ((*(p)-=(v))+(v))
@@ -26,7 +28,7 @@ static size_t reminder_task_count;
 static char auth_device_id[65];
 static bool standby_auth;
 static unsigned preconnect_until_ms, preconnect_refresh_ms, random_value;
-static bool auth_sent, terminal_notified;
+static bool auth_sent, terminal_notified, credential_rejected;
 static SemaphoreHandle_t playback_lock=(void*)1;
 static QueueHandle_t rx_queue=(void*)2;
 /* 单线程替身验证所有快照读写走短临界区，不模拟跨核调度。 */
@@ -116,7 +118,7 @@ static void reset(void)
     CHECK(rx_bytes==0);
     state=WS_STATE_CONNECTED; stop_flag=client_started=inject_disconnect=queue_fail=false;
     played_frames=0; decoded_samples=960; clock_ms=1000; reminder_task_count=0;
-    auth_sent=true; standby_auth=terminal_notified=false; preconnect_until_ms=preconnect_refresh_ms=0;
+    auth_sent=true; standby_auth=terminal_notified=credential_rejected=false; preconnect_until_ms=preconnect_refresh_ms=0;
     random_value=1; auth_device_id[0]=0;
     reset_speech_status();
     memset(reminder_device_id,0,sizeof(reminder_device_id));
@@ -172,9 +174,9 @@ static void session_checks(void)
     reset(); control("{\"type\":\"error\",\"code\":5000}"); audio();
     CHECK(events[EV_WS_SERVER_ERROR]==1 && state==WS_STATE_ERROR && decoded==0);
     reset(); control("{\"type\":\"error\",\"code\":2000}"); audio();
-    CHECK(events[EV_WS_AUTH_FAILED]==1 && state==WS_STATE_ERROR && decoded==0);
+    CHECK(events[EV_WS_AUTH_FAILED]==1 && state==WS_STATE_ERROR && decoded==0 && credential_rejected);
     reset(); state=WS_STATE_AUTHING; control("{bad json}");
-    CHECK(events[EV_WS_AUTH_FAILED]==1 && state==WS_STATE_ERROR);
+    CHECK(events[EV_WS_AUTH_FAILED]==1 && state==WS_STATE_ERROR && !credential_rejected);
     reset(); control("{bad json}"); audio(); CHECK(state==WS_STATE_CONNECTED && decoded==1);
     reset(); decoded_samples=-1; audio(); CHECK(events[EV_WS_SERVER_ERROR]==1);
     reset(); inject_disconnect=true; audio(); CHECK(!events[EV_WS_SERVER_ERROR]);

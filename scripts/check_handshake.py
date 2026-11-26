@@ -22,9 +22,15 @@ def main():
         "main/device_handshake_http.c",
         "managed_components/espressif__cjson/cJSON/cJSON.c",
     ]
+    cache_exe = output / "cache-checks.exe"
+    cache_sources = ["-Itests/handshake_host", "-Itests/ui_host",
+                     "-Imanaged_components/espressif__cjson/cJSON",
+                     "tests/device_handshake_cache_checks.c", "main/device_handshake_cache.c",
+                     "main/device_handshake.c", "managed_components/espressif__cjson/cJSON/cJSON.c"]
     with (output / "checks.log").open("w", encoding="utf-8") as log:
-        for command in ([args.cc, "-std=c11", "-Wall", "-Werror", "-o", str(executable), *sources],
-                        [str(executable)]):
+        compiler = [args.cc, "-std=c11", "-Wall", "-Werror", "-o"]
+        for command in ([*compiler, str(executable), *sources], [str(executable)],
+                        [*compiler, str(cache_exe), *cache_sources], [str(cache_exe)]):
             result = subprocess.run(command, cwd=root, text=True, encoding="utf-8",
                                     errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             log.write(result.stdout)

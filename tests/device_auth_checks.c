@@ -19,6 +19,8 @@
 #define WIFI_STATE_GOT_IP 1
 #define ACOS_WS_URL "wss://legacy.example/realtime"
 #define DEVICE_HANDSHAKE_WS_REFRESH_MARGIN_SECONDS 300u
+#define HANDSHAKE_CACHE_REUSE_MS 120000
+#define HANDSHAKE_BACKGROUND_DELAY_MS 6000
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) (*(p) = (v))
 #define atomic_compare_exchange_strong(p, e, v) ((*(p) == *(e)) ? (*(p) = (v), 1) : (*(e) = *(p), 0))
@@ -35,14 +37,18 @@ int64_t esp_timer_get_time(void) { return test_now * 1000; }
 uint32_t esp_random(void) { return 1234; }
 
 static bool s_initialized, s_disabled, s_pending;
+static bool s_ws_waiting_for_credentials;
 static device_handshake_config_t config;
 static device_handshake_config_t *s_config;
 static device_handshake_schedule_t s_schedule;
 static unsigned s_seen_epoch, s_network_epoch, s_cancel_generation, s_mqtt_epoch;
+static int64_t s_reuse_until_ms, test_wall_ms;
+static unsigned cache_erasures;
 typedef struct {
     unsigned network_epoch;
     uint32_t generation;
     int64_t acquired_ms;
+    int64_t cached_server_ms;
     device_handshake_config_t config;
     device_handshake_result_t result;
 } handshake_attempt_t;
@@ -70,6 +76,17 @@ static int xQueueReceive(test_queue_t *queue, handshake_attempt_t **item, unsign
 }
 /* 只记录生产代码的校时请求，绝不修改宿主机时钟。 */
 struct timeval { long tv_sec, tv_usec; };
+static int gettimeofday(struct timeval *tv, void *tz)
+{
+    (void)tz;
+    tv->tv_sec = (long)(test_wall_ms / 1000);
+    tv->tv_usec = (long)((test_wall_ms % 1000) * 1000);
+    return 0;
+}
+static void device_handshake_cache_save(const device_handshake_config_t *cfg,
+                                         const device_handshake_response_t *response)
+{ CHECK(cfg == s_config && response->websocket.token[0]); }
+static void device_handshake_cache_erase(void) { ++cache_erasures; }
 static int settimeofday(const struct timeval *tv, const void *timezone)
 {
     CHECK(timezone == NULL);
@@ -152,12 +169,15 @@ static void fresh(void)
     release_attempt(jobs_queue.item); release_attempt(results_queue.item);
     jobs_queue.item = results_queue.item = NULL;
     s_jobs = s_results = NULL; s_pending = false;
+    s_ws_waiting_for_credentials = false;
     http_requests = clock_updates = s_mqtt_epoch = 0; applied_server_time_ms = 0;
     memset(&config, 0, sizeof(config)); config.enabled = true; s_config = &config;
     s_schedule = (device_handshake_schedule_t){ .online = true, .ready = true, .generation = 1 };
     s_initialized = true; s_disabled = false;
     s_seen_epoch = s_network_epoch = s_cancel_generation = 1;
     test_now = 1000;
+    s_reuse_until_ms = test_wall_ms = 0;
+    cache_erasures = 0;
     s_snapshot = calloc(1, sizeof(*s_snapshot)); CHECK(s_snapshot != NULL);
     s_snapshot->generation = s_schedule.generation;
     s_snapshot->network_epoch = s_network_epoch;
@@ -201,55 +221,171 @@ static void handshake_poll_checks(void)
     const device_handshake_response_t *response = NULL;
     ++s_network_epoch;
     CHECK(!device_handshake_service_get_configuration()); /* 回调后、poll 前也不可用。 */
-    device_handshake_service_poll(false);
+    device_handshake_service_poll(false, false);
     CHECK(s_snapshot == cached && !s_schedule.ready && !s_schedule.online && !http_requests);
     CHECK(device_handshake_service_websocket_epoch() != cache_epoch);
     CHECK(s_cancel_generation == s_schedule.generation && s_mqtt_epoch == 1);
     CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
     ++s_network_epoch;
-    device_handshake_service_poll(true);
-    /* D3 只保留快照；恢复联网仍需一次 HTTP，不能宣称旧 token 已复用。 */
+    device_handshake_service_poll(true, false);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY);
+    CHECK(response == &cached->result.response && !s_pending && !http_requests);
+    test_now += HANDSHAKE_BACKGROUND_DELAY_MS;
+    device_handshake_service_poll(true, false);
     CHECK(s_snapshot == cached && !s_schedule.ready && s_pending && http_requests == 1);
     CHECK(s_mqtt_epoch == 2 && jobs_queue.item->generation == s_schedule.generation);
     CHECK(jobs_queue.item->network_epoch == s_network_epoch);
-    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING && !response);
-    for (unsigned i = 0; i < 3; ++i) device_handshake_service_poll(true);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY && response);
+    for (unsigned i = 0; i < 3; ++i) device_handshake_service_poll(true, false);
     CHECK(http_requests == 1);
     handshake_attempt_t *finished = finish_http(200, true);
-    device_handshake_service_poll(true);
+    device_handshake_service_poll(true, false);
     CHECK(s_snapshot == finished && s_schedule.ready && !s_pending && http_requests == 1);
     CHECK(clock_updates == 1 && applied_server_time_ms == 1700000000123LL);
     CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY);
     CHECK(response && strcmp(response->websocket.token, "new-test-only-token") == 0);
     CHECK(device_handshake_service_renew_credentials() && !s_snapshot && !s_schedule.ready);
-    device_handshake_service_poll(true);
+    device_handshake_service_poll(true, false);
     CHECK(http_requests == 2 && s_pending); /* 显式续期仍触发新请求。 */
 
     for (unsigned stale = 0; stale < 2; ++stale) {
         fresh(); cached = s_snapshot;
-        ++s_network_epoch; device_handshake_service_poll(true);
+        ++s_network_epoch; device_handshake_service_poll(true, false);
+        test_now += HANDSHAKE_BACKGROUND_DELAY_MS; device_handshake_service_poll(true, false);
         finished = finish_http(200, true);
         /* 分别验证两道门禁，避免其中一项正确掩盖另一项失效。 */
         if (stale == 0) --finished->network_epoch;
         else --finished->generation;
-        device_handshake_service_poll(true);
+        device_handshake_service_poll(true, false);
         CHECK(s_snapshot == cached && !s_schedule.ready && !s_schedule.blocked && !clock_updates);
         CHECK(strcmp(cached->result.response.websocket.token, "device-test-only") == 0);
-        CHECK(!device_handshake_service_get_configuration() && http_requests == 2 && s_pending);
+        CHECK(device_handshake_service_get_configuration() == &cached->result.response &&
+              http_requests == 2 && s_pending);
     }
 
     const int permanent[] = {401, 403, 404};
     for (unsigned i = 0; i < sizeof(permanent) / sizeof(permanent[0]); ++i) {
-        fresh(); ++s_network_epoch; device_handshake_service_poll(true);
-        finish_http(permanent[i], false); device_handshake_service_poll(true);
+        fresh(); ++s_network_epoch; device_handshake_service_poll(true, false);
+        test_now += HANDSHAKE_BACKGROUND_DELAY_MS; device_handshake_service_poll(true, false);
+        finish_http(permanent[i], false); device_handshake_service_poll(true, false);
         CHECK(!s_snapshot && s_schedule.blocked && !s_pending && http_requests == 1);
         CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_BLOCKED && !response);
         CHECK(!device_handshake_service_renew_credentials());
-        ++s_network_epoch; device_handshake_service_poll(false);
-        ++s_network_epoch; device_handshake_service_poll(true);
+        ++s_network_epoch; device_handshake_service_poll(false, false);
+        ++s_network_epoch; device_handshake_service_poll(true, false);
         CHECK(s_schedule.blocked && !s_snapshot && !device_handshake_service_get_configuration());
         CHECK(http_requests == 1 && !clock_updates);
+        CHECK(cache_erasures == 1);
     }
+}
+
+static void boot_cache_checks(void)
+{
+    const int64_t issued = 1700000100000LL;
+    const device_handshake_response_t *response = NULL;
+    fresh();
+    s_schedule.online = s_schedule.ready = false;
+    s_snapshot->cached_server_ms = issued;
+    test_wall_ms = issued + 3300000;
+    device_handshake_service_poll(true, false);
+    CHECK(!http_requests && device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY);
+    ++test_wall_ms; /* Less than five minutes remaining. */
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+    device_handshake_service_poll(true, true);
+    CHECK(http_requests == 1 && device_handshake_service_busy());
+
+    fresh();
+    s_schedule.online = s_schedule.ready = false;
+    s_snapshot->cached_server_ms = issued;
+    test_wall_ms = issued + 3600000;
+    device_handshake_service_poll(true, false);
+    CHECK(http_requests == 1 && device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+
+    fresh();
+    s_schedule.online = s_schedule.ready = false;
+    s_snapshot->cached_server_ms = issued;
+    test_wall_ms = 500;
+    device_handshake_service_poll(true, false);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY && !http_requests);
+    test_now += HANDSHAKE_CACHE_REUSE_MS;
+    device_handshake_service_poll(true, false);
+    CHECK(http_requests == 1 && device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+    ++s_network_epoch; device_handshake_service_poll(true, false);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+
+    fresh();
+    ++s_network_epoch; device_handshake_service_poll(true, false);
+    CHECK(!http_requests && device_handshake_service_renew_credentials() && cache_erasures == 1);
+    device_handshake_service_poll(true, false);
+    CHECK(http_requests == 1 && device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+
+    fresh();
+    ++s_network_epoch; device_handshake_service_poll(true, false);
+    unsigned epoch = device_handshake_service_websocket_epoch();
+    const device_handshake_response_t *old = &s_snapshot->result.response;
+    CHECK(ws_service_set_credentials(old->websocket.url, old->websocket.token) == ESP_OK);
+    test_now += HANDSHAKE_BACKGROUND_DELAY_MS; device_handshake_service_poll(true, false);
+    handshake_attempt_t *newer = finish_http(200, true);
+    strcpy(newer->result.response.websocket.url, old->websocket.url);
+    device_handshake_service_poll(true, false);
+    CHECK(device_handshake_service_websocket_epoch() == epoch && http_requests == 1);
+    CHECK(!refresh_rejected_voice_credentials(false) && cache_erasures == 0);
+    CHECK(refresh_rejected_voice_credentials(true) && s_snapshot == newer && cache_erasures == 0);
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY &&
+          response == &newer->result.response);
+}
+
+static void voice_priority_handshake_checks(void)
+{
+    const device_handshake_response_t *response = NULL;
+    fresh();
+    ++s_network_epoch;
+    device_handshake_service_poll(true, true);
+    unsigned epoch = device_handshake_service_websocket_epoch();
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_READY);
+    test_now += HANDSHAKE_BACKGROUND_DELAY_MS;
+    device_handshake_service_poll(true, true);
+    CHECK(!http_requests && !device_handshake_service_busy());
+    CHECK(device_handshake_service_websocket_epoch() == epoch && s_mqtt_epoch == 1);
+    test_now += HANDSHAKE_CACHE_REUSE_MS;
+    device_handshake_service_poll(true, true); /* Already authenticated; no new dial. */
+    CHECK(!http_requests && !device_handshake_service_get_configuration());
+    CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
+    device_handshake_service_poll(true, true); /* New dial now requires fresh credentials. */
+    CHECK(http_requests == 1 && device_handshake_service_busy());
+    finish_http(200, true);
+    CHECK(device_handshake_service_busy());
+    device_handshake_service_poll(true, true);
+    CHECK(!device_handshake_service_busy() && http_requests == 1 && s_schedule.ready);
+
+    fresh();
+    ++s_network_epoch;
+    device_handshake_service_poll(true, false);
+    test_now += HANDSHAKE_BACKGROUND_DELAY_MS;
+    device_handshake_service_poll(true, false); /* Refresh starts before wake. */
+    CHECK(device_handshake_service_busy() && http_requests == 1);
+    finish_http(503, false);
+    device_handshake_service_poll(true, true);
+    CHECK(!device_handshake_service_busy() && s_schedule.failures == 1);
+    test_now = s_schedule.retry_at_ms;
+    device_handshake_service_poll(true, true);
+    CHECK(!device_handshake_service_busy() && http_requests == 1);
+    device_handshake_service_poll(true, false); /* End of call permits overdue retry. */
+    CHECK(device_handshake_service_busy() && http_requests == 2);
+    ++s_network_epoch;
+    device_handshake_service_poll(false, true);
+    CHECK(device_handshake_service_busy());
+    finish_http(200, true);
+    device_handshake_service_poll(false, true);
+    CHECK(!device_handshake_service_busy() && !clock_updates && !s_schedule.online);
+
+    fresh();
+    CHECK(device_handshake_service_renew_credentials());
+    device_handshake_service_poll(true, true);
+    CHECK(device_handshake_service_busy() && http_requests == 1);
+    finish_http(401, false);
+    device_handshake_service_poll(true, true);
+    CHECK(!device_handshake_service_busy() && s_schedule.blocked);
 }
 
 static void builder_checks(void)
@@ -304,6 +440,22 @@ static void builder_checks(void)
 
 static void connection_checks(void)
 {
+    /* Cold/recovery dial also waits for a real in-flight HTTPS job even when
+     * the cached credentials could already be used. */
+    fresh();
+    ++s_network_epoch;
+    device_handshake_service_poll(true, false);
+    test_now += HANDSHAKE_BACKGROUND_DELAY_MS;
+    device_handshake_service_poll(true, false);
+    CHECK(device_handshake_service_busy());
+    retry_voice_connection(test_now);
+    CHECK(!connects && !stops && retry_at_ms && !auth_deadline_ms);
+    finish_http(503, false);
+    retry_voice_connection(test_now);
+    CHECK(!connects && !stops);
+    device_handshake_service_poll(true, true);
+    retry_voice_connection(test_now);
+    CHECK(connects==1 && !retry_at_ms && auth_deadline_ms==test_now+20000);
     fresh();
     device_mqtt_delivery_t batch={.device_id="dev-123",.count=2,.task_ids={"42","43"}};
     reminder_task=&batch; retry_voice_connection(test_now);
@@ -369,16 +521,24 @@ static void lifetime_and_failure_checks(void)
     for (unsigned i = 0; i < 10; ++i)
         CHECK(device_handshake_service_prepare_websocket(&response) == DEVICE_WS_WAITING);
     CHECK(s_schedule.generation == 2); /* 轮询不会重新刷新或重置退避。 */
-    fresh(); handle_voice_auth_failure("rejected");
+    fresh(); handle_voice_auth_failure("rejected", true);
     CHECK(voice_auth_refresh_used && recoveries == 1 && !ends && !s_snapshot);
     CHECK(s_schedule.generation == 2 && retry_at_ms == test_now + 5000);
-    handle_voice_auth_failure("rejected again");
+    handle_voice_auth_failure("rejected again", true);
     CHECK(ends == 1 && recoveries == 1 && !session_requested && s_schedule.generation == 2);
-    fresh(); s_schedule.blocked = true; handle_voice_auth_failure("rejected");
+    fresh(); s_schedule.blocked = true; handle_voice_auth_failure("rejected", true);
     CHECK(s_schedule.blocked && s_schedule.generation == 1);
     test_now += 5000; retry_voice_connection(test_now); CHECK(ends == 1 && !connects);
-    fresh(); s_disabled = true; handle_voice_auth_failure("legacy invalid");
+    fresh(); s_disabled = true; handle_voice_auth_failure("legacy invalid", true);
     CHECK(ends == 1 && !recoveries);
+    fresh(); voice_auth_refresh_used = true;
+    handle_voice_auth_failure("timed out", false);
+    CHECK(ends == 1 && cache_erasures == 0 && s_snapshot && !http_requests);
+    fresh(); voice_auth_refresh_used = true;
+    CHECK(ws_service_set_credentials(s_snapshot->result.response.websocket.url,
+          s_snapshot->result.response.websocket.token) == ESP_OK);
+    handle_voice_auth_failure("rejected again", true);
+    CHECK(ends == 1 && cache_erasures == 1 && !http_requests && s_schedule.generation == 1);
 }
 
 static void credential_boundary_checks(void)
@@ -444,7 +604,7 @@ static void preconnect_send_checks(void)
 
 int main(void)
 {
-    handshake_poll_checks(); builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
+    handshake_poll_checks(); boot_cache_checks(); voice_priority_handshake_checks(); builder_checks(); connection_checks(); lifetime_and_failure_checks(); credential_boundary_checks();
     preconnect_send_checks(); release_credentials(credentials); clear_snapshot();
     printf("PASS: %u device voice authentication checks (production code; mocked transport)\n", checks);
     return 0;

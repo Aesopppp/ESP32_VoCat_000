@@ -1,4 +1,5 @@
 #include "ws_service.h"
+#include "wifi_service.h"
 #include "audio_out.h"
 #include "proto_service.h"
 #include "ws_rx_policy.h"
@@ -32,6 +33,7 @@ static bool standby_auth;
 static atomic_uint preconnect_until_ms;
 static atomic_uint preconnect_refresh_ms;
 static atomic_bool auth_sent, terminal_notified;
+static atomic_bool credential_rejected;
 static portMUX_TYPE control_lock = portMUX_INITIALIZER_UNLOCKED;
 static event_t pending_control;
 static uint8_t *frame;
@@ -164,13 +166,15 @@ static bool observe_speech_event(proto_event_t event, const rx_frame_t *packet)
  * minimum_free_bytes 是开机以来的低水位；不同阶段快照用于实板判断泄漏/碎片。 */
 static void log_connection_memory(const char *phase)
 {
-    multi_heap_info_t internal, external;
+    multi_heap_info_t internal, external, dma;
     heap_caps_get_info(&internal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     heap_caps_get_info(&external, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "Connection heap [%s]: internal free=%u largest=%u min=%u; PSRAM free=%u largest=%u min=%u",
+    heap_caps_get_info(&dma, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "Connection heap [%s]: internal free=%u largest=%u min=%u; PSRAM free=%u largest=%u min=%u; internal DMA free=%u largest=%u",
              phase, (unsigned)internal.total_free_bytes, (unsigned)internal.largest_free_block,
              (unsigned)internal.minimum_free_bytes, (unsigned)external.total_free_bytes,
-             (unsigned)external.largest_free_block, (unsigned)external.minimum_free_bytes);
+             (unsigned)external.largest_free_block, (unsigned)external.minimum_free_bytes,
+             (unsigned)dma.total_free_bytes, (unsigned)dma.largest_free_block);
 }
 
 /* 仅在鉴权发送前计算一次，输入就是本次将发送的 token，而非固件默认值。
@@ -345,7 +349,10 @@ static void handle_frame(const rx_frame_t *packet)
     } else if (msg.evt == PROTO_EVT_ERROR) {
         log_server_error(&msg);
         app_event_id_t id = EV_WS_SERVER_ERROR;
-        if (phase == WS_STATE_AUTHING || proto_is_auth_error(&msg)) id = EV_WS_AUTH_FAILED;
+        if (proto_is_auth_error(&msg)) {
+            atomic_store(&credential_rejected, true);
+            id = EV_WS_AUTH_FAILED;
+        } else if (phase == WS_STATE_AUTHING) id = EV_WS_AUTH_FAILED;
         else if (phase == WS_STATE_PREAUTHING || phase == WS_STATE_PRECONNECTED ||
                  phase == WS_STATE_ACTIVATING) id = EV_WS_PRECONNECT_REJECTED;
         atomic_store(&terminal_notified, true);
@@ -397,18 +404,21 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         /* 已创建网络任务/transport，尚未分配本轮 TLS 握手内存。 */
         log_connection_memory("before-tls");
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
+        wifi_service_set_setup_active(WIFI_SETUP_WS, false);
         if (state != WS_STATE_CONNECTING) return;
         state = standby_auth ? WS_STATE_PREAUTHING : WS_STATE_AUTHING;
         reset_speech_status();
         log_connection_memory("connected");
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
+        wifi_service_set_setup_active(WIFI_SETUP_WS, false);
         state = WS_STATE_DISCONNECTED;
         reset_speech_status();
         log_transport_error("disconnected", event);
         release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
         if (!atomic_exchange(&terminal_notified, true)) publish(EV_WS_DISCONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
+        wifi_service_set_setup_active(WIFI_SETUP_WS, false);
         state = WS_STATE_ERROR;
         reset_speech_status();
         log_transport_error("error", event);
@@ -506,6 +516,14 @@ static void release_credentials(proto_ws_credentials_t *value)
     free(value);
 }
 
+bool ws_service_received_credential_rejection(void) { return atomic_load(&credential_rejected); }
+
+bool ws_service_credentials_superseded(const char *url, const char *token)
+{
+    return credentials_from_handshake && credentials &&
+           (strcmp(credentials->url, url) != 0 || strcmp(credentials->token, token) != 0);
+}
+
 esp_err_t ws_service_set_credentials(const char *url, const char *token)
 {
     if (!client || client_started || state != WS_STATE_DISCONNECTED) return ESP_ERR_INVALID_STATE;
@@ -581,11 +599,14 @@ esp_err_t ws_service_connect(void)
     if (client_started) return ESP_OK;
     atomic_store(&auth_sent, false);
     atomic_store(&terminal_notified, false);
+    atomic_store(&credential_rejected, false);
     state = WS_STATE_CONNECTING;
     reset_speech_status();
+    wifi_service_set_setup_active(WIFI_SETUP_WS, true);
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
     else {
+        wifi_service_set_setup_active(WIFI_SETUP_WS, false);
         state = WS_STATE_ERROR;
         log_connection_memory("start-failed");
     }
@@ -669,6 +690,7 @@ esp_err_t ws_service_disconnect(void)
 {
     if (!client) return ESP_ERR_INVALID_STATE;
     bool was_started = client_started;
+    wifi_service_set_setup_active(WIFI_SETUP_WS, false);
     state = WS_STATE_DISCONNECTED;
     reset_speech_status();
     /* 先解除 worker 的 PCM 背压，再等待 transport/播放器锁，避免关闭互等。 */

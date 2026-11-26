@@ -47,7 +47,7 @@ extern "C" {
  * AFE 自身已经做静音持续时间判定；这里只额外容忍短暂无声帧。
  * 此值不是原始麦克风的总句尾等待时间，也不参与平台打断。 */
 #define WAKE_WORD_FIRST_PHRASE_SILENCE_MS 160u
-#define WAKE_WORD_LIVE_RB_ITEM_COUNT 16u  /* 16 × 32 ms = 512 ms */
+#define WAKE_WORD_LIVE_RB_ITEM_COUNT 96u  /* 3.072 s while the encoder drains the first phrase. */
 
 /** PSRAM FIFO backing store including per-item headers. Wake-to-connect replay
  * may use the full capacity; ordinary live audio is bounded to 512 ms. */
@@ -160,9 +160,9 @@ void wake_word_select_hot_pre_roll(void);
  * and resume the cold first-phrase policy. Only effective before upload. */
 void wake_word_fallback_cold_pre_roll(void);
 
-/** 正式鉴权成功后、创建上传任务前调用。热连接冻结截至此刻的 PCM，
- *  编码端读完即切实时；激活慢时允许冷连接的句尾保护。冷连接沿用
- *  首句读完或追到 512 ms 内切实时。true 表示已接管此轮 WakeNet 预录音。
+/** 正式鉴权成功后、创建上传任务前调用。等待鉴权时先连续保存 PCM。
+ *  热连接冻结截至此刻的 PCM；冷连接在句尾或追到实时窗口时交接。
+ *  编码端按序读完首句和交接期间的尾音。true 表示已接管此轮 WakeNet 预录音。
  *  false 表示无有效预录音，主调继续旧清空行为。不会启停 AFE 或上传任务。 */
 bool wake_word_prepare_pre_roll_upload(void);
 

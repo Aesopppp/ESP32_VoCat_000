@@ -350,8 +350,10 @@ static void http_checks(void)
 {
     device_handshake_result_t result;
     fake_http_t fake = fake_default();
+    fake.read_delay_ms = 2;
     run_exchange(&fake, "1.4.2", &result);
     CHECK(result.success && result.status == 200 && fake.reads > 1);
+    CHECK(result.read_ms == 2 * fake.reads);
     CHECK(strcmp(result.response.websocket.token, "test-only-token") == 0);
     fake = fake_default(); fake.declared = -1;
     run_exchange(&fake, "1.4.2", &result);
@@ -368,6 +370,7 @@ static void http_checks(void)
     fake = fake_default(); fake.read_delay_ms = 15001;
     run_exchange(&fake, "1.4.2", &result);
     CHECK(!result.success && result.status == 0 && fake.reads == 1);
+    CHECK(result.read_ms == 15001);
     fake = fake_default(); fake.declared = DEVICE_HANDSHAKE_RESPONSE_MAX + 1;
     run_exchange(&fake, "1.4.2", &result);
     CHECK(!result.success && result.status == 200 && fake.reads == 0);

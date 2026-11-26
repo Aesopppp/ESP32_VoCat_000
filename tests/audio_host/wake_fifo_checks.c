@@ -26,6 +26,7 @@ static SemaphoreHandle_t s_audio_buffer_lock=(void*)2;
 static bool s_audio_buffer_enabled=true;
 static bool s_pre_roll_enabled, s_pre_roll_uploading, s_hot_pre_roll;
 static bool s_first_phrase_speech_seen, s_first_phrase_closed, s_live_buffer_active;
+static bool s_protect_handoff_tail;
 static uint32_t s_first_phrase_silence_samples, s_first_phrase_end, s_live_read_end;
 static uint32_t s_wake_boundary_sample, s_afe_sample_end, s_pre_roll_dropped_frames;
 static int s_fetch_chunksize=512;
@@ -307,11 +308,12 @@ static void hot_slow_activation_checks(void)
     wake_word_select_hot_pre_roll(); enter_lite_mode();
     for(unsigned i=1;i<=19;++i)
         push_vad_frame((int16_t)(1000+i),false,i==1 ? VAD_SPEECH : VAD_SILENCE);
-    CHECK(s_first_phrase_closed && queued==17 && live_queued==2);
-    uint32_t boundary=s_first_phrase_end;
-    CHECK(wake_word_prepare_pre_roll_upload() && s_first_phrase_end==boundary);
+    CHECK(!s_first_phrase_closed && queued==19 && !live_queued);
+    CHECK(wake_word_prepare_pre_roll_upload() && s_first_phrase_end==s_audio_progress.written_end);
+    CHECK(s_protect_handoff_tail);
     current=APP_STATE_LISTENING;
-    for(unsigned i=1;i<=19;++i) read_frame((int16_t)(1000+i));
+    push_frame(1020,false);
+    for(unsigned i=1;i<=20;++i) read_frame((int16_t)(1000+i));
     CHECK(!s_hot_pre_roll && s_audio_progress.read_end==s_audio_progress.written_end);
 }
 
@@ -321,6 +323,7 @@ static void first_phrase_handoff_checks(void)
     reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
     for(unsigned i=1;i<=20;++i) push_vad_frame((int16_t)i,false,VAD_SILENCE);
     CHECK(!s_first_phrase_speech_seen && !s_first_phrase_closed && queued==20);
+    CHECK(wake_word_prepare_pre_roll_upload());
     push_frame(1021,false); CHECK(s_first_phrase_speech_seen);
     for(unsigned i=22;i<=25;++i) push_vad_frame((int16_t)i,false,VAD_SILENCE);
     CHECK(!s_first_phrase_closed && s_first_phrase_silence_samples==2048);
@@ -332,8 +335,8 @@ static void first_phrase_handoff_checks(void)
     uint32_t end=s_first_phrase_end;
     CHECK(end==32*512 && s_live_read_end==end && !live_queued);
     for(unsigned i=32;i<=71;++i) push_frame((int16_t)i,false);
-    CHECK(s_first_phrase_end==end && queued==31 && live_queued==16);
-    CHECK(s_live_read_end==end+24*512 && s_audio_progress.read_end==512);
+    CHECK(s_first_phrase_end==end && queued==31 && live_queued==40);
+    CHECK(s_live_read_end==end && s_audio_progress.read_end==512);
     CHECK(s_audio_progress.written_end==72*512 && !s_pre_roll_dropped_frames);
     CHECK(wake_word_prepare_pre_roll_upload()); current=APP_STATE_PLAYING;
     /* TX progress cannot unlock a frozen phrase, even when the live tail is short. */
@@ -344,15 +347,17 @@ static void first_phrase_handoff_checks(void)
     /* Source switches at the next read, without a TX confirmation or a server ACK. */
     int16_t output[512]; uint32_t sample_end=0;
     CHECK(wake_word_read_audio(output,sizeof(output),&sample_end)==sizeof(output));
-    CHECK(output[0]==56 && output[511]==56 && sample_end==57*512);
+    CHECK(output[0]==32 && output[511]==32 && sample_end==33*512);
     CHECK(s_live_buffer_active && !s_pre_roll_enabled && !s_pre_roll_uploading);
-    for(unsigned i=57;i<=71;++i) CHECK(read_frame((int16_t)i)==(i+1)*512);
+    push_frame(72,false); /* A producer immediately after the switch preserves the backlog. */
+    CHECK(live_queued==40);
+    for(unsigned i=33;i<=72;++i) CHECK(read_frame((int16_t)i)==(i+1)*512);
     CHECK(!live_queued && s_audio_progress.read_end==s_audio_progress.written_end);
     CHECK(wake_word_read_audio(output,sizeof(output),&sample_end)==0);
     /* Later audio remains ordinary bounded live FIFO for the whole session. */
-    for(unsigned i=72;i<=101;++i) push_frame((int16_t)i,false);
+    for(unsigned i=73;i<=102;++i) push_frame((int16_t)i,false);
     CHECK(!queued && live_queued==16);
-    for(unsigned i=86;i<=101;++i) CHECK(read_frame((int16_t)i)==(i+1)*512);
+    for(unsigned i=87;i<=102;++i) CHECK(read_frame((int16_t)i)==(i+1)*512);
     CHECK(!live_queued && s_audio_progress.read_end==s_audio_progress.written_end);
     wake_word_set_pre_roll(false);
     CHECK(!queued && !live_queued && !s_first_phrase_closed && !s_live_buffer_active);
@@ -366,6 +371,7 @@ static void first_phrase_empty_live_and_wrap_checks(void)
     reset(); s_afe_sample_end=UINT32_MAX-1535; push_frame(900,true);
     current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
     uint32_t boundary=s_wake_boundary_sample;
+    CHECK(wake_word_prepare_pre_roll_upload());
     push_frame(1001,false);
     for(unsigned i=2;i<=6;++i) push_vad_frame((int16_t)i,false,VAD_SILENCE);
     CHECK(s_first_phrase_closed && queued==6 && !live_queued);
@@ -379,6 +385,7 @@ static void first_phrase_empty_live_and_wrap_checks(void)
     CHECK(s_audio_progress.written_end==s_audio_progress.read_end);
     /* Full replay FIFO still closes; missing new frames remain explicit. */
     reset(); ring_capacity=2; push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
+    CHECK(wake_word_prepare_pre_roll_upload());
     push_frame(1001,false); push_frame(2,false);
     for(unsigned i=3;i<=7;++i) push_vad_frame((int16_t)i,false,VAD_SILENCE);
     CHECK(s_first_phrase_closed && s_pre_roll_dropped_frames==5 && queued==2);
@@ -395,10 +402,38 @@ static void first_phrase_empty_live_and_wrap_checks(void)
     CHECK(read_frame(10)==s_wake_boundary_sample+512 && !live_queued);
 }
 
+static void delayed_authentication_checks(void)
+{
+    /* An early pause during HTTPS must not turn the rest of the recording
+     * into a rolling live window before the encoder is allowed to start. */
+    reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
+    for(unsigned i=1;i<=WAKE_WORD_RB_ITEM_COUNT;++i)
+        push_vad_frame((int16_t)(1000+i),false,i>=3 && i<=50 ? VAD_SILENCE : VAD_SPEECH);
+    CHECK(queued==WAKE_WORD_RB_ITEM_COUNT && !live_queued && !s_pre_roll_dropped_frames);
+    CHECK(wake_word_prepare_pre_roll_upload()); current=APP_STATE_LISTENING;
+    for(unsigned i=1;i<=WAKE_WORD_RB_ITEM_COUNT;++i) read_frame((int16_t)(1000+i));
+    CHECK(!queued && !s_pre_roll_enabled);
+
+    reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE; enter_lite_mode();
+    push_frame(1001,false);
+    CHECK(wake_word_prepare_pre_roll_upload()); current=APP_STATE_LISTENING;
+    for(unsigned i=2;i<=6;++i) push_vad_frame((int16_t)i,false,VAD_SILENCE);
+    CHECK(s_first_phrase_closed);
+    unsigned last=6+WAKE_WORD_LIVE_RB_ITEM_COUNT+3;
+    for(unsigned i=7;i<=last;++i) push_frame((int16_t)i,false);
+    CHECK(live_queued==WAKE_WORD_LIVE_RB_ITEM_COUNT);
+    CHECK(s_live_read_end-s_first_phrase_end==3*512);
+    read_frame(1001);
+    for(unsigned i=2;i<=6;++i) read_frame((int16_t)i);
+    for(unsigned i=10;i<=last;++i) CHECK(read_frame((int16_t)i)==(i+1)*512);
+    CHECK(!live_queued && !s_protect_handoff_tail && !s_pre_roll_dropped_frames);
+}
+
 static void first_phrase_mode_boundary_checks(void)
 {
     reset(); push_frame(900,true); current=APP_STATE_WS_CONNECTING_WAKE;
     /* WAKE's trailing speech and following silence cannot finish the first phrase. */
+    CHECK(wake_word_prepare_pre_roll_upload());
     push_frame(1001,false);
     for(unsigned i=0;i<12;++i) push_vad_frame(0,false,VAD_SILENCE);
     CHECK(queued==13 && !s_first_phrase_speech_seen && !s_first_phrase_closed);
@@ -470,6 +505,7 @@ int main(void)
     hot_handoff_checks(0); hot_handoff_checks(1);
     hot_handoff_checks(5); hot_handoff_checks(16);
     hot_slow_activation_checks();
+    delayed_authentication_checks();
     first_phrase_handoff_checks(); first_phrase_empty_live_and_wrap_checks();
     first_phrase_mode_boundary_checks();
 #else

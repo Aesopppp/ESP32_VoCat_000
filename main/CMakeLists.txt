@@ -25,6 +25,7 @@ idf_component_register(
         "wifi_service.c"
         "cfg_service.c"
         "device_handshake.c"
+        "device_handshake_cache.c"
         "device_handshake_http.c"
         "device_handshake_service.c"
         "device_mqtt_protocol.c"

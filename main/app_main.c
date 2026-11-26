@@ -41,6 +41,7 @@
 #include "wifi_service.h"
 #include "cfg_service.h"
 #include "device_handshake_service.h"
+#include "device_handshake_cache.h"
 #include "device_preconnect_config.h"
 #include "device_mqtt_service.h"
 #include "log_service.h"
@@ -153,6 +154,22 @@ static int64_t preconnect_deadline_ms, preconnect_poll_at_ms;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+/* Give the first voice TLS dial a head start. Once released, MQTT reconnects
+ * and configuration updates are independent of the voice service. */
+static const device_handshake_response_t *mqtt_startup_configuration(
+    const device_handshake_response_t *config, int64_t now, int64_t *deadline)
+{
+    if (!config || *deadline < 0) return config;
+    if (DEVICE_WS_PRECONNECT_ENABLED && !preconnect_unsupported) {
+        ws_conn_state_t state = ws_service_get_state();
+        if (!*deadline) *deadline = now + 4000;
+        if (state != WS_STATE_PRECONNECTED && state != WS_STATE_CONNECTED && now < *deadline)
+            return NULL;
+    }
+    *deadline = -1;
+    return config;
+}
+
 static void release_reminder(bool handled)
 {
     if (!reminder_task) return;
@@ -209,25 +226,39 @@ static void recover_session(const char *reason)
     led_set_ws_err();
 }
 
-static void handle_voice_auth_failure(const char *reason)
+static bool refresh_rejected_voice_credentials(bool retry)
+{
+    const device_handshake_response_t *latest = device_handshake_service_get_configuration();
+    if (latest && ws_service_credentials_superseded(latest->websocket.url, latest->websocket.token)) {
+        if (retry) ESP_LOGI(TAG, "Retrying voice authentication with newer HTTP credentials");
+        return retry;
+    }
+    if (retry) return device_handshake_service_renew_credentials();
+    if (latest) device_handshake_cache_erase();
+    return false;
+}
+
+static void handle_voice_auth_failure(const char *reason, bool rejected)
 {
     if (!session_requested) return;
     if (!device_handshake_service_is_enabled() || voice_auth_refresh_used) {
+        if (rejected && device_handshake_service_is_enabled())
+            (void)refresh_rejected_voice_credentials(false);
         ESP_LOGE(TAG, "Voice authentication failed; automatic retries stopped (check gateway auth protocol)");
         end_conversation(reason);
         return;
     }
     voice_auth_refresh_used = true;
     recover_session(reason);
-    if (device_handshake_service_renew_credentials())
-        ESP_LOGW(TAG, "Voice authentication rejected; requesting fresh device token once");
+    if (rejected) (void)refresh_rejected_voice_credentials(true);
     /* 若 HTTP 已因 401/403 等停止，下一次 prepare 会返回 BLOCKED，不能强行 refresh 解锁。 */
 }
 
 static void retry_voice_connection(int64_t now)
 {
     if (!session_requested || cleanup_pending || !retry_at_ms || now < retry_at_ms ||
-        wifi_service_get_state() != WIFI_STATE_GOT_IP || provisioning_service_is_active()) return;
+        wifi_service_get_state() != WIFI_STATE_GOT_IP || provisioning_service_is_active() ||
+        device_handshake_service_busy()) return;
     const device_handshake_response_t *configuration = NULL;
     device_ws_readiness_t readiness = device_handshake_service_prepare_websocket(&configuration);
     if (readiness == DEVICE_WS_BLOCKED) {
@@ -321,6 +352,9 @@ static void poll_preconnection(int64_t now, bool check_now)
     if (!DEVICE_WS_PRECONNECT_ENABLED || preconnect_unsupported || cleanup_pending ||
         provisioning_service_is_active() || wifi_service_get_state() != WIFI_STATE_GOT_IP) return;
     if (conversation_active || (session_requested && !preconnect_owned)) return;
+    /* Keep the idle socket and the wake recording until the HTTP worker has
+     * released TLS. Recheck the endpoint and lease before using that socket. */
+    if (device_handshake_service_busy()) return;
     if (preconnect_owned && preconnect_deadline_ms && now >= preconnect_deadline_ms) {
         abandon_preconnection("transport/auth timed out");
         return;
@@ -416,10 +450,12 @@ static bool handle_preconnection_event(event_type_t type)
     case EV_WS_AUTH_FAILED:
         /* One HTTP renewal for a rejected key, then wait for fresh credentials
          * or a user wake. A capacity rejection (4002) never consumes this retry. */
-        if (!preconnect_token_renewed && device_handshake_service_renew_credentials()) {
+        if (!preconnect_token_renewed && refresh_rejected_voice_credentials(true)) {
             preconnect_token_renewed = true;
             if (session_requested) voice_auth_refresh_used = true;
         } else {
+            if (preconnect_token_renewed && ws_service_received_credential_rejection())
+                (void)refresh_rejected_voice_credentials(false);
             preconnect_epoch = device_handshake_service_websocket_epoch();
             preconnect_token_blocked = true;
         }
@@ -460,9 +496,11 @@ static void start_conversation(const char *reason)
     session_requested = true;
     resume_deadline_ms = now_ms() + 60000;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
+    bool http_busy = device_handshake_service_busy();
+    if (http_busy) ESP_LOGI(TAG, "Wake queued until HTTP handshake releases TLS: %s", reason);
     /* 只有 WakeNet 检测任务可建立预录音边界；触屏、按键、提醒沿用旧行为。 */
     if (strcmp(reason, "wake word") != 0) wake_word_set_pre_roll(false);
-    else if (preconnect_owned && ws_service_get_state() == WS_STATE_PRECONNECTED)
+    else if (!http_busy && preconnect_owned && ws_service_get_state() == WS_STATE_PRECONNECTED)
         wake_word_select_hot_pre_roll();
     if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
         end_conversation("could not prepare microphone");
@@ -473,16 +511,19 @@ static void start_conversation(const char *reason)
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         led_set_connecting();
         retry_at_ms = 0;
+        /* Resume a queued wake on the first poll after TLS cleanup, even
+         * when the next idle credential/lease check is still 500 ms away. */
+        preconnect_poll_at_ms = 0;
         if (ws_service_get_state() == WS_STATE_PREAUTHING &&
             preconnect_deadline_ms > now_ms() + 1500) preconnect_deadline_ms = now_ms() + 1500;
         poll_preconnection(now_ms(), true);
-    } else if (ws_service_get_state() == WS_STATE_CONNECTED) {
+    } else if (!http_busy && ws_service_get_state() == WS_STATE_CONNECTED) {
         start_audio_session(reason);
     } else {
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         retry_at_ms = now_ms();
         led_set_connecting();
-        ESP_LOGI(TAG, "Conversation requested: %s; opening WebSocket", reason);
+        ESP_LOGI(TAG, "Conversation requested: %s", reason);
     }
 }
 
@@ -698,6 +739,7 @@ static void poll_reminder(void)
 static void main_task(void *arg)
 {
     (void)arg;
+    int64_t mqtt_startup_deadline = 0;
     /* 后台 HTTP 负责获取凭据；开启后语音连接必须通过有效快照，不回退到旧 key。 */
     esp_err_t handshake_err = device_handshake_service_init();
     if (handshake_err != ESP_OK)
@@ -827,7 +869,7 @@ static void main_task(void *arg)
                 recover_session("server protocol error (see ws_service error code)");
                 break;
             case EV_WS_AUTH_FAILED:
-                handle_voice_auth_failure("gateway authentication rejected");
+                handle_voice_auth_failure("gateway authentication rejected", ws_service_received_credential_rejection());
                 break;
             case EV_WS_FORMAT_ERROR:
                 end_conversation("gateway audio format incompatible with Opus");
@@ -854,15 +896,20 @@ static void main_task(void *arg)
         }
         int64_t now = now_ms();
         if (cleanup_pending && now >= cleanup_at_ms) stop_session_audio();
+        /* A settled standby socket can coexist with a refresh. Its TLS dial,
+         * activation and the entire voice session have priority over optional HTTP. */
+        bool voice_priority = session_requested || cleanup_pending ||
+                              (preconnect_owned && preconnect_deadline_ms != 0);
         device_handshake_service_poll(wifi_service_get_state() == WIFI_STATE_GOT_IP &&
-                                      !provisioning_service_is_active());
+                                      !provisioning_service_is_active(), voice_priority);
         device_mqtt_service_set_dispatch_allowed(
             wifi_service_get_state() == WIFI_STATE_GOT_IP &&
             !provisioning_service_is_active() && !cleanup_pending && !reminder_task &&
             (!session_requested || conversation_active));
         device_mqtt_service_poll(device_handshake_service_is_enabled() && !device_handshake_service_is_blocked() &&
             wifi_service_get_state() == WIFI_STATE_GOT_IP && !provisioning_service_is_active(),
-            device_handshake_service_mqtt_epoch(), device_handshake_service_get_configuration());
+            device_handshake_service_mqtt_epoch(), mqtt_startup_configuration(
+                device_handshake_service_get_configuration(), now, &mqtt_startup_deadline));
         poll_reminder();
         poll_conversation();
         save_volume_if_due(now);
@@ -872,7 +919,7 @@ static void main_task(void *arg)
             end_conversation("conversation recovery expired");
         }
         if (auth_deadline_ms && now >= auth_deadline_ms) {
-            if (awaiting_voice_auth) handle_voice_auth_failure("gateway authentication timed out");
+            if (awaiting_voice_auth) handle_voice_auth_failure("gateway authentication timed out", false);
             else recover_session("WebSocket connection timed out");
         }
         retry_voice_connection(now);

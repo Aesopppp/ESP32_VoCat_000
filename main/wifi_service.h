@@ -79,6 +79,15 @@ esp_err_t wifi_service_disconnect(void);
  */
 esp_err_t wifi_service_set_audio_active(bool active);
 
+/* Each service owns one handshake window. Duplicate start/stop notifications
+ * are safe, including when a WebSocket connection is cancelled from main. */
+typedef enum {
+    WIFI_SETUP_HTTP = 1,
+    WIFI_SETUP_WS = 2,
+    WIFI_SETUP_MQTT = 4,
+} wifi_setup_t;
+void wifi_service_set_setup_active(wifi_setup_t owner, bool active);
+
 /**
  * @brief 获取当前 Wi-Fi 状态
  */

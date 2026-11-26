@@ -50,6 +50,9 @@ esp_err_t ws_service_init(void);
  * 两参数均 NULL 才读取旧 NVS 配置，调用者仅在握手显式关闭时允许这样做。
  * 生命周期调用之间不会自动回退到旧配置，不写入 NVS。 */
 esp_err_t ws_service_set_credentials(const char *url, const char *token);
+/* Main task only. A rejected transport may still hold a token superseded by HTTP. */
+bool ws_service_credentials_superseded(const char *url, const char *token);
+bool ws_service_received_credential_rejection(void);
 esp_err_t ws_service_connect(void);
 esp_err_t ws_service_disconnect(void);
 esp_err_t ws_service_deinit(void);

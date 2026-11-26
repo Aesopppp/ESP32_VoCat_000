@@ -66,7 +66,9 @@ void device_handshake_exchange(const device_handshake_http_t *http,
     const int64_t deadline = http->now_ms(http->context) + 15000;
     char chunk[512];
     while (!http->cancelled(http->context) && http->now_ms(http->context) < deadline) {
+        int64_t read_start = http->now_ms(http->context);
         int count = http->read(http->context, chunk, sizeof(chunk));
+        output->read_ms += http->now_ms(http->context) - read_start;
         if (count < 0 || (count == 0 && !http->complete(http->context))) {
             if (output->status == 200) output->status = 0;
             output->reason = "response_read_failed";

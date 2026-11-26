@@ -31,15 +31,16 @@ def main():
     output = root / "work/device-ws-auth"
     output.mkdir(parents=True, exist_ok=True)
     groups = {
-        "device_handshake_service.c": ("release_attempt", "clear_snapshot",
+        "device_handshake_service.c": ("snapshot_remaining_ms", "release_attempt", "clear_snapshot",
             "device_handshake_service_get_configuration",
-            "device_handshake_service_is_enabled", "device_handshake_service_websocket_epoch",
+            "device_handshake_service_is_enabled", "device_handshake_service_busy",
+            "device_handshake_service_websocket_epoch",
             "device_handshake_service_renew_credentials",
             "device_handshake_service_prepare_websocket", "device_handshake_service_poll"),
-        "ws_service.c": ("release_credentials", "ws_service_set_credentials", "ws_service_prepare_device_auth", "ws_service_prepare_preconnect",
+        "ws_service.c": ("release_credentials", "ws_service_credentials_superseded", "ws_service_set_credentials", "ws_service_prepare_device_auth", "ws_service_prepare_preconnect",
             "ws_service_preconnect_valid", "ws_service_preconnect_refresh_due",
             "send_auth", "ws_service_authenticate", "ws_service_activate_preconnection"),
-        "app_main.c": ("handle_voice_auth_failure", "retry_voice_connection"),
+        "app_main.c": ("refresh_rejected_voice_credentials", "handle_voice_auth_failure", "retry_voice_connection"),
     }
     for file, names in groups.items():
         source = (root / "main" / file).read_text(encoding="utf-8")

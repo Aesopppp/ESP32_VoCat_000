@@ -18,8 +18,13 @@ static bool conversation_active, session_requested, cleanup_pending;
 static bool pre_roll_active, mode_kept_pre_roll, wake_on_return_to_idle;
 static unsigned pre_roll_prepares, pre_roll_cancels;
 static bool preconnect_owned, preconnect_unsupported, valid_lease, hot_pre_roll;
-static bool refresh_due;
+static bool refresh_due, http_busy;
+bool device_handshake_service_busy(void) { return http_busy; }
 static bool preconnect_token_renewed, preconnect_token_blocked;
+static bool credentials_superseded;
+static unsigned boot_cache_erasures;
+void device_handshake_cache_erase(void) { ++boot_cache_erasures; }
+bool ws_service_received_credential_rejection(void) { return true; }
 static unsigned preconnect_epoch, preconnect_failures, http_epoch;
 static int64_t preconnect_deadline_ms, preconnect_poll_at_ms;
 static unsigned dials, preauth, activations, prepared_tasks;
@@ -49,6 +54,10 @@ static unsigned esp_random(void) { return 17; }
 device_ws_readiness_t device_handshake_service_prepare_websocket(const device_handshake_response_t **cfg)
 { *cfg = readiness == DEVICE_WS_READY ? &configuration : NULL; return readiness; }
 unsigned device_handshake_service_websocket_epoch(void) { return http_epoch; }
+const device_handshake_response_t *device_handshake_service_get_configuration(void)
+{ return readiness == DEVICE_WS_READY ? &configuration : NULL; }
+bool ws_service_credentials_superseded(const char *url, const char *token)
+{ CHECK(url == configuration.websocket.url && token == configuration.websocket.token); return credentials_superseded; }
 bool device_handshake_service_renew_credentials(void)
 { if (readiness!=DEVICE_WS_READY) return false; ++http_epoch; readiness=DEVICE_WS_WAITING; return true; }
 esp_err_t ws_service_set_credentials(const char *url, const char *token)
@@ -125,10 +134,12 @@ static void recover_session(const char *reason)
 static void reset(void)
 {
     preconnect_owned=preconnect_unsupported=hot_pre_roll=false;
+    http_busy=false;
     preconnect_token_renewed=preconnect_token_blocked=false;
     preconnect_epoch=preconnect_failures=dials=preauth=activations=prepared_tasks=0;
     preconnect_deadline_ms=preconnect_poll_at_ms=0; http_epoch=1;
-    valid_lease=true; refresh_due=false; activation_result=ESP_OK; readiness=DEVICE_WS_READY;
+    boot_cache_erasures=0;
+    valid_lease=true; refresh_due=credentials_superseded=false; activation_result=ESP_OK; readiness=DEVICE_WS_READY;
     strcpy(configuration.mqtt.username,"dev_test");
     strcpy(configuration.websocket.url,"wss://example"); strcpy(configuration.websocket.token,"test");
     strcpy(batch.device_id,"dev_test"); strcpy(batch.task_ids[0],"a"); strcpy(batch.task_ids[1],"b");
@@ -314,6 +325,64 @@ static void standby_ready(void)
     CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
     CHECK(!starts && !activations && preconnect_owned && !preconnect_deadline_ms);
 }
+
+static void wake_during_http_checks(void)
+{
+    reset();
+    http_busy=true;
+    poll_preconnection(clock_ms,true);
+    CHECK(!dials && !preconnect_owned);
+
+    reset();
+    standby_ready();
+    http_busy=true;
+    refresh_due=true;
+    clock_ms+=500;
+    poll_preconnection(clock_ms,false);
+    CHECK(dials==1 && preconnect_owned);
+    pre_roll_active=true;
+    start_conversation("wake word");
+    CHECK(session_requested && mode_kept_pre_roll && pre_roll_active && !hot_pre_roll);
+    CHECK(current_state==APP_STATE_WS_CONNECTING_WAKE && !activations && !starts);
+    CHECK(handle_preconnection_event(EV_WS_PRECONNECT_READY));
+    clock_ms+=6000;
+    poll_preconnection(clock_ms,false);
+    CHECK(!activations && !preconnect_deadline_ms && !clears && !retry_at_ms);
+    http_busy=false;
+    poll_preconnection(clock_ms,false);
+    CHECK(activations==1 && dials==1 && preconnect_deadline_ms>clock_ms);
+    ws_state=WS_STATE_CONNECTED;
+    CHECK(!handle_preconnection_event(EV_WS_AUTH_OK));
+    start_audio_session("wake retained during HTTPS");
+    CHECK(starts==1 && pre_roll_prepares==1 && !clears);
+
+    reset();
+    standby_ready();
+    http_busy=pre_roll_active=true;
+    start_conversation("wake word");
+    ++http_epoch;
+    http_busy=false;
+    poll_preconnection(clock_ms,true);
+    CHECK(!activations && !preconnect_owned && retry_at_ms && pre_roll_active);
+
+    reset();
+    standby_ready();
+    http_busy=pre_roll_active=true;
+    start_conversation("wake word");
+    clock_ms+=20;
+    http_busy=false;
+    poll_preconnection(clock_ms,false);
+    CHECK(activations==1 && dials==1 && !starts);
+
+    reset();
+    standby_ready();
+    http_busy=pre_roll_active=true;
+    start_conversation("wake word");
+    handle_talk_action("cancel while waiting for HTTPS");
+    http_busy=false;
+    poll_preconnection(clock_ms,true);
+    CHECK(!session_requested && !activations && !starts && !pre_roll_active);
+}
 static void standby_refresh_checks(void)
 {
     reset();
@@ -414,9 +483,12 @@ static void standby_checks(void)
     CHECK(preconnect_token_renewed && !preconnect_token_blocked && http_epoch==2 && !starts);
     readiness=DEVICE_WS_READY; clock_ms+=7000; poll_preconnection(clock_ms,false);
     CHECK(preconnect_owned && dials==2); CHECK(handle_preconnection_event(EV_WS_AUTH_FAILED));
-    CHECK(preconnect_token_blocked && http_epoch==2); clock_ms+=100000;
+    CHECK(preconnect_token_blocked && http_epoch==2 && boot_cache_erasures==1); clock_ms+=100000;
     poll_preconnection(clock_ms,false); CHECK(!preconnect_owned && dials==2);
     ++http_epoch; clock_ms+=501; poll_preconnection(clock_ms,false); CHECK(dials==3 && preconnect_owned);
+    reset(); standby_transport(); credentials_superseded=true;
+    CHECK(handle_preconnection_event(EV_WS_AUTH_FAILED));
+    CHECK(preconnect_token_renewed && !preconnect_token_blocked && http_epoch==1 && readiness==DEVICE_WS_READY);
     reset(); standby_ready(); ++http_epoch; pre_roll_active=true; start_conversation("wake word");
     CHECK(!preconnect_owned && retry_at_ms && !activations && pre_roll_active && !hot_pre_roll);
     reset(); standby_ready(); readiness=DEVICE_WS_WAITING; clock_ms+=501;
@@ -437,12 +509,37 @@ static void standby_checks(void)
     CHECK(!handle_preconnection_event(EV_WS_SESSION_CLOSED));
     end_conversation("platform closed"); CHECK(!retry_at_ms && !preconnect_owned);
 }
+static void mqtt_startup_checks(void)
+{
+    reset();
+    int64_t deadline = 0;
+    CHECK(!mqtt_startup_configuration(NULL, 10, &deadline) && !deadline);
+    if (DEVICE_WS_PRECONNECT_ENABLED) {
+        CHECK(!mqtt_startup_configuration(&configuration, 20, &deadline));
+        CHECK(!mqtt_startup_configuration(&configuration, 4019, &deadline));
+        CHECK(mqtt_startup_configuration(&configuration, 4020, &deadline) == &configuration);
+        CHECK(mqtt_startup_configuration(&configuration, 4021, &deadline) == &configuration);
+        deadline = 0;
+        ws_state = WS_STATE_PRECONNECTED;
+        CHECK(mqtt_startup_configuration(&configuration, 20, &deadline) == &configuration);
+        deadline = 0;
+        ws_state = WS_STATE_CONNECTED;
+        CHECK(mqtt_startup_configuration(&configuration, 20, &deadline) == &configuration);
+        deadline = 0;
+        ws_state = WS_STATE_DISCONNECTED;
+        preconnect_unsupported = true;
+    }
+    CHECK(mqtt_startup_configuration(&configuration, 20, &deadline) == &configuration);
+}
+
 int main(void)
 {
+    mqtt_startup_checks();
     silence_checks(); conversation_checks(); wake_pre_roll_checks(); task_checks(); touch_checks();
     if (DEVICE_WS_PRECONNECT_ENABLED) {
         standby_checks();
         standby_refresh_checks();
+        wake_during_http_checks();
     }
     else {
         reset(); poll_preconnection(clock_ms, true);

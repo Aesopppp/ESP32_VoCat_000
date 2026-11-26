@@ -76,6 +76,7 @@ static bool s_pre_roll_enabled = false; /* 与 FIFO 一起由 s_audio_buffer_loc
 static bool s_pre_roll_uploading;
 static bool s_hot_pre_roll; /* Only a WakeNet wake using an already connected socket. */
 static bool s_first_phrase_speech_seen, s_first_phrase_closed, s_live_buffer_active;
+static bool s_protect_handoff_tail;
 static uint32_t s_first_phrase_silence_samples, s_first_phrase_end, s_live_read_end;
 static uint32_t s_wake_boundary_sample = 0;
 static uint32_t s_afe_sample_end; /* 每个有效 fetch 帧推进，包括待机；不随 FIFO 清空复位。 */
@@ -122,6 +123,7 @@ static void clear_audio_buffer_locked(void)
     s_overflow_frames = 0;
     s_pre_roll_enabled = s_pre_roll_uploading = s_hot_pre_roll = false;
     s_first_phrase_speech_seen = s_first_phrase_closed = s_live_buffer_active = false;
+    s_protect_handoff_tail = false;
     s_first_phrase_silence_samples = s_first_phrase_end = s_live_read_end = 0;
     s_wake_boundary_sample = s_pre_roll_dropped_frames = 0;
 }
@@ -148,14 +150,14 @@ static bool observe_first_phrase_locked(int vad_state, bool valid_voice, bool li
         s_first_phrase_silence_samples = 0;
     } else if (vad_state == VAD_SILENCE && s_first_phrase_speech_seen) {
         s_first_phrase_silence_samples += s_fetch_chunksize;
-        bool short_activation = s_hot_pre_roll &&
-            s_audio_progress.written_end - s_wake_boundary_sample <=
-                BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS;
-        if (!short_activation && s_first_phrase_silence_samples >=
+        /* During authentication the encoder cannot run. Even audio after a
+         * pause belongs in the full pre-roll queue until upload is possible. */
+        if (s_pre_roll_uploading && s_first_phrase_silence_samples >=
             BSP_I2S_SAMPLE_RATE / 1000u * WAKE_WORD_FIRST_PHRASE_SILENCE_MS) {
             /* 包含已存入的句尾静音；首句满队列时缺失帧已计入 dropped_new。
              * 这里只分段补传缓存，不判断语义、控制播放或发送 cancel。 */
             s_first_phrase_closed = true;
+            s_protect_handoff_tail = true;
             s_first_phrase_end = s_audio_progress.written_end;
             s_live_read_end = s_first_phrase_end;
             return true;
@@ -203,6 +205,12 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
         /* 超容量返回实际长度，让消费者显式报错，不能把异常帧当作队列空。 */
         vRingbufferReturnItem(ringbuf, item);
     }
+    /* Keep queued tail frames across the source switch. Only restore the
+     * steady-state limit when the encoder has room for the next live frame. */
+    if (s_protect_handoff_tail && s_live_buffer_active &&
+        s_audio_progress.written_end - s_live_read_end <
+            BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS)
+        s_protect_handoff_tail = false;
     xSemaphoreGive(s_audio_buffer_lock);
     if (switched)
         ESP_LOGI(TAG, "%s queued; switched to live audio (skipped_ms=%lu live_ms=%lu)",
@@ -294,7 +302,8 @@ static void buffer_afe_audio(const afe_fetch_result_t *res, bool wake_detected, 
             }
         }
     } else {
-        const size_t max_frames = (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
+        const size_t max_frames = s_protect_handoff_tail ? WAKE_WORD_LIVE_RB_ITEM_COUNT :
+            (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
         while (audio_buffer_frames_locked(ringbuf) >= max_frames &&
                discard_oldest_audio_locked(ringbuf, read_end))
             ++dropped;
@@ -415,15 +424,6 @@ static void detect_Task(void *arg)
 {
     (void)arg;
 
-    /* fetch 输出缓冲区（AFE 可能输出多通道，回合单通道给 audio_in） */
-    int16_t *fetch_buff = malloc(s_afe_chunksize * sizeof(int16_t));
-    if (fetch_buff == NULL) {
-        ESP_LOGE(TAG, "detect: malloc failed");
-        s_task_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
     ESP_LOGI(TAG, "detect_Task started (core %d)", xPortGetCoreID());
     ESP_LOGI(TAG, "Platform interruption enabled; local VAD never cancels playback");
 
@@ -432,9 +432,16 @@ static void detect_Task(void *arg)
         /* 模式可能在 fetch 返回与入队之间切换；保留实际产出这帧的 AFE，
          * 不把最后一帧 WAKE 的 VAD 误当成新 LITE 的人声。 */
         void *source_afe = s_afe_data;
-        afe_fetch_result_t *res = s_afe_iface->fetch(source_afe);
+        /* The main task switches to LITE after the wake event. Keep the
+         * reader responsive while the old WAKE handle stops receiving PCM. */
+        bool switching_after_wake = source_afe == s_afe_data_wake &&
+                                    s_wake_state == WAKE_STATE_DETECTED;
+        afe_fetch_result_t *res = switching_after_wake
+            ? s_afe_iface->fetch_with_delay(source_afe, pdMS_TO_TICKS(48))
+            : s_afe_iface->fetch(source_afe);
 
         if (res == NULL || res->ret_value == ESP_FAIL) {
+            if (source_afe != s_afe_data) continue;
             ESP_LOGW(TAG, "AFE fetch failed or EOF");
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -466,7 +473,6 @@ static void detect_Task(void *arg)
 
     }
 
-    free(fetch_buff);
     ESP_LOGI(TAG, "detect_Task exited");
     vTaskDelete(NULL);
 }
@@ -793,6 +799,8 @@ bool wake_word_prepare_pre_roll_upload(void)
             s_first_phrase_closed = true;
             s_first_phrase_end = s_audio_progress.written_end;
             s_live_read_end = s_first_phrase_end;
+            s_protect_handoff_tail = s_first_phrase_end - s_audio_progress.read_end >
+                BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS;
         }
         s_pre_roll_uploading = true;
         ESP_LOGI(TAG, "%s upload ready: boundary_sample=%lu buffered_ms=%lu dropped_new=%lu",

@@ -113,6 +113,7 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void stop_client(mqtt_worker_t *w)
 {
+    wifi_service_set_setup_active(WIFI_SETUP_MQTT, false);
     if (w->client) {
         /* 不在回调停止自身。destroy 完成后才允许替换回调借用的配置。 */
         esp_mqtt_client_stop(w->client);
@@ -357,6 +358,7 @@ static void consume_notice(mqtt_worker_t *w, const mqtt_notice_t *event)
     if (!w->client) return;
     switch (event->id) {
     case MQTT_EVENT_CONNECTED:
+        wifi_service_set_setup_active(WIFI_SETUP_MQTT, false);
         w->connected = true;
         w->connect_deadline = 0;
         w->retry.auth_failures = 0;
@@ -430,6 +432,7 @@ static void start_client(mqtt_worker_t *w)
         .buffer.size = 1024, .buffer.out_size = 1024,
         .outbox.limit = 16384,
     };
+    wifi_service_set_setup_active(WIFI_SETUP_MQTT, true);
     w->client = esp_mqtt_client_init(&config);
     if (!w->client ||
         esp_mqtt_client_register_event(w->client, ESP_EVENT_ANY_ID, mqtt_event, w) != ESP_OK ||

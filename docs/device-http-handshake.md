@@ -101,14 +101,20 @@ idf.py build
 NVS 中的 `enabled:false` 也会覆盖编译配置。NVS 读取失败、类型错误、超长、隐藏 NUL 或
 JSON 无效时停止新握手，不回退到可能属于另一台设备的身份。JSON 上限 4096 字节。
 
-本轮仅增加 NVS 读取，未提供批量注入工具、配网页写 PSK 功能，也不会自动写入或擦除身份。
+出厂身份由设备配置提供；运行凭据使用同一命名空间下的独立缓存键。
 量产应采用每台设备独立身份、统一固件和经验证的安全注入流程；普通 NVS、私有头文件和
 编译进固件的 PSK 都不等于已完成加密保护。原工程的 `cfg_service_init()` 还保留 NVS
 异常时擦除分区的既有恢复代码；量产前应单独评估该行为对出厂身份的保护。
 
-MQTT password 和 WS token 只保存在 RAM，不反复写 Flash。断网/重新配网/显式刷新会清除
-可用快照。平台轮换运行凭据后，可由未来控制入口调用 `device_handshake_service_refresh()`
-重新读取出厂配置并发起握手；当前未绑定按键或远程命令，重启也会重新读取配置。
+每次成功 HTTP 握手后，将 MQTT 和 WS 运行凭据作为一条紧凑记录写入 NVS。当前固件未启用 NVS 加密。
+更换设备号、PSK、型号或平台地址会使旧记录失效。读写缓存失败时可以走普通 HTTP 握手。
+取得 IP 后，有效缓存可先用于待机 WS，新 HTTPS 握手让出约 6 秒的建连窗口。
+如果语音先开始，可选刷新推迟到会话结束。如果唤醒时 HTTPS 已经启动，设备会打印
+`Wake queued until HTTP handshake releases TLS`，唤醒词触发的录音继续保存在 PSRAM。
+主任务收到 HTTP 结果后复核网关和凭据，再激活待机连接或发起新连接。
+凭据不可用时仍会执行必要握手并遵循失败退避。
+设备已知当前时间时，要求 token 至少还剩 300 秒。断电导致时钟未校准时，只在启动后的 120 秒内
+尝试用缓存向平台鉴权。后台仍会取得新凭据。MQTT 首次拨号最多给语音预连接让出 4 秒。
 
 ## 5. 请求与响应
 
@@ -184,12 +190,12 @@ HTTPS 使用证书包和主机名验证，未添加跳过证书验证开关。�
 使用的 token 来源、长度和 SHA-256 指纹（`Auth token: ...`），不输出原文或 auth JSON。
 平台模式来源应为 `HTTP/handshake/websocket.token`；仅显式关闭握手时才应看到
 `NVS/korvo_cfg/acos_token`。来源正确不等于认证成功，仍以网关成功事件为准。
-平台模式不会覆盖原来的 NVS key，也不会将短期 token 持久化。
+平台模式使用独立的 NVS 启动缓存，沿用原来的日志来源标识。
 
 ### 语音凭据生命周期
 
-- TTL 使用单调时钟，以请求开始时刻为保守基准，扣除网络和主任务排队时间，避免校时延长有效期。
-- 唤醒时握手未完成：主任务继续显示连接状态并等待后台结果，不建立旧 key 的 WS。
+- 本次开机在线获取的 token 使用单调时钟，以请求开始时刻为基准计算剩余寿命。跨重启缓存按上文的服务器时间与有效期规则检查。
+- 唤醒时若握手未完成且没有可用缓存，主任务显示连接状态并等待后台结果。
 - 剩余时间少于安全窗口：发起一次续期，后续轮询不会重置请求代次/退避。
 - URL/token 整组复制到 WS 服务约 3 KiB 的 PSRAM 快照。URL 改变时重建已停止的 transport，
   避免组件 URI 更新遗留旧端口/路径；同地址换 token 不重建 transport。
@@ -236,7 +242,7 @@ python scripts/check_audio.py --cc D:\ESP32-ymos-1\work\host-tools\tcc\tcc.exe
 
 本轮固件烧录后应观察（以下为验收步骤，不代表已完成实板测试）：
 
-1. 正确配置：`HTTP handshake started` → `HTTP handshake ready; ... (RAM only)`，
+1. 无缓存首次开机，观察 `HTTP handshake started`、`HTTP handshake timing (ms)` 和 `HTTP handshake ready`，
    同时由平台确认登记设备、型号、固件版本和 MAC 正确。唤醒后应出现
    `Connecting WebSocket; credentials=device handshake` 和
    `Auth token: source=HTTP/handshake/websocket.token ...`，随后才是 `WebSocket authenticated`。
@@ -245,7 +251,8 @@ python scripts/check_audio.py --cc D:\ESP32-ymos-1\work\host-tools\tcc\tcc.exe
 4. 临时网络或 5xx：按 5/15/60 秒退避；恢复后成功。
 5. 请求中断 Wi-Fi，再恢复：旧结果丢弃，只接受新请求。
 6. 现有唤醒、正常对话、打断、屏幕菜单、BOOT/触屏配网回归；观察内部堆和任务栈余量。
-7. 联网后立即唤醒：先等待 HTTP，再打开语音；不能出现旧 NVS token 的发送日志。
+7. 成功握手后重启，观察 `Wi-Fi ready; cached credentials available for preconnect` 和
+   `Opening standby WebSocket`，对比两次开机从取得 IP 到 `Standby WebSocket ready` 的时间。
 8. token 接近过期后再次唤醒：先续期；有效期充足时再次唤醒不增加 HTTP 请求。
 9. 语音鉴权拒绝：最多一次重新握手；再次拒绝后结束会话，无无限重连。
 

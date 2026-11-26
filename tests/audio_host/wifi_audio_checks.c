@@ -23,6 +23,7 @@ static void *s_wifi_event_group, *s_connect_timer;
 static wifi_state_t s_wifi_state;
 static atomic_bool s_connect_enabled;
 static bool s_audio_active, timer_active;
+static unsigned s_setup_active;
 static int64_t s_connect_deadline_us;
 static wifi_ps_type_t applied_mode = WIFI_PS_MIN_MODEM;
 static esp_err_t mode_result;
@@ -57,6 +58,17 @@ int main(void)
     s_wifi_state = WIFI_STATE_GOT_IP;
     CHECK(wifi_service_set_audio_active(false) == ESP_OK);
     CHECK(applied_mode == WIFI_PS_MIN_MODEM);
+    wifi_service_set_setup_active(WIFI_SETUP_HTTP, true);
+    wifi_service_set_setup_active(WIFI_SETUP_WS, true);
+    wifi_service_set_setup_active(WIFI_SETUP_MQTT, true);
+    wifi_service_set_setup_active(WIFI_SETUP_HTTP, false);
+    wifi_service_set_setup_active(WIFI_SETUP_WS, false);
+    wifi_service_set_setup_active(WIFI_SETUP_WS, false);
+    CHECK(applied_mode == WIFI_PS_NONE && s_setup_active == WIFI_SETUP_MQTT);
+    CHECK(wifi_service_set_audio_active(true) == ESP_OK);
+    wifi_service_set_setup_active(WIFI_SETUP_MQTT, false);
+    CHECK(applied_mode == WIFI_PS_NONE && s_setup_active == 0);
+    CHECK(wifi_service_set_audio_active(false) == ESP_OK && applied_mode == WIFI_PS_MIN_MODEM);
     CHECK(wifi_service_set_audio_active(true) == ESP_OK);
     CHECK(applied_mode == WIFI_PS_NONE);
 
